@@ -1,0 +1,205 @@
+syntax = "proto3";
+option cc_generic_services = true;
+option go_package = "example.com/goliath/proto/crawler/v1;crawlerv1";
+
+package yuanshi.crawler.downloader;
+
+message RedirectItem {
+  string redirect_url = 1;
+  int32 status_code = 2;
+}
+
+enum RequestType {
+  GET = 0;
+  POST = 1;
+  HEAD = 2; // only get header
+}
+
+enum SearchSource {
+  UNKNOWN = 0;
+  GOOGLE = 1; // support
+  BING = 2; // support
+  DUCKDUCKGO = 3; // support
+  YAHOO = 4; // support
+  METAPHOR = 5; // support
+  YANDEX = 6;
+  ASK = 7; // support
+  YOUTUBE = 8;
+  BAIDU = 9;
+  TOUTIAO = 10;
+  GOOGLE_IMAGE = 11;
+  YAHOO_IMAGE = 12; // support
+  SO_IMAGE = 13;
+  BAIDU_IMAGE = 14; // support
+  TOUTIAO_NEWS = 15;
+  SOGOU_WEIXIN = 16;
+  GOOGLE_NEWS = 17; // support
+  DUCKDUCKGO_NEWS = 18; // support
+  DUCKDUCKGO_IMAGE = 19; // support
+  MIXED = 20; // google or duckduckgo random
+  SOGOU = 21;
+  SOGOU_NEWS = 22;
+  BAIDU_NEWS = 23;
+  SO360 = 24;
+  SO360_NEWS = 25;
+}
+
+message TaskInfo {
+  uint32 task_id = 1;
+  string task_name = 2;
+  string extra_data = 3;
+};
+
+message Proxy {
+  string proxy_host = 1;
+  int32 proxy_port = 2;
+  string username = 3;
+  string password = 4;
+}
+
+enum UAType {
+  WISE = 0;
+  PC = 1;
+}
+
+enum ERROR_CODE {
+  SUCCESS = 0;
+  SCHEME_ERR = 1;
+  URL_TOO_LONG_ERR = 2;
+  INTERNAL_ERR = 3;
+  TRANS_ENCODING_ERR = 4;
+}
+
+enum ResponseType {
+  SYNC = 0;
+  ASYNC_KAFKA = 1;
+};
+
+enum CrawlType {
+   HTML = 0;
+   IMAGE = 1;
+   VIDEO = 2;
+};
+
+enum ImageUploadMethod {
+  UP_ASYNC = 0;
+  UP_SYNC = 1;
+};
+
+// only support cos region ap-beijing
+message ImageCosInfo {
+  string cos_bucket = 1;
+  string cos_path = 2;
+}
+
+message CrawlRequest {
+  string id = 1;
+  string url = 2;
+  RequestType request_type = 3;
+  Proxy proxy = 4;
+  int32 timeout_ms = 5;
+  int32 connect_timeout_ms = 6;
+  UAType ua_type = 7; // default pc
+  string user_agent = 8;
+  string referer = 9;
+  string cookies = 10;
+  map<string, string> http_headers = 11;
+  bytes post_body = 12;
+  int64 crawl_timestamp = 13;
+  ResponseType response_type = 14;
+  SearchSource search_source = 15;
+  string query = 16;
+  TaskInfo task_info = 17;
+  CrawlType crawl_type = 18;
+  bool output_markdown = 19;
+  bool enable_render = 20;
+  ImageUploadMethod image_upload_method = 21;
+  ImageCosInfo image_cos_info = 22;
+}
+
+message CrawlResponse {
+  string id = 1;
+  CrawlRequest request = 2;
+  string target_url = 3;
+  bytes content = 4; // gzip compress
+  int32 content_len = 5;
+  int32 time_cost_ms = 6;
+  string response_headers = 7;
+  repeated RedirectItem redirect_item_list = 8;
+  int32 status_code = 9;
+  ERROR_CODE err_code = 10;
+  string err_message = 11;
+  int32 redirect_count = 12;
+  string encoding = 13; // 原始编码
+  int64 crawl_timestamp = 14;
+  ResponseType response_type = 15;
+  string crawl_pod_ip = 16;
+  bytes markdown_content = 17; // gzip compress
+  int32 markdown_content_len = 18;
+}
+
+enum RetCode {
+  RET_SUCCESS = 0;
+  DOWNLOAD_FAILED = 1;
+  PARSE_FAILED = 2;
+}
+
+enum SearchTimeType {
+  NO_LIMIT = 0;
+  HOUR = 1;
+  DAY = 2;
+  WEEK = 3;
+  MONTH = 4;
+  YEAR = 5;
+  USER_DEFINED = 6;
+}
+
+// support google and bing
+message TimeRange {
+  SearchTimeType search_time_type = 1;
+  string time_begin = 2; // only for USER_DEFINED, format: 20241201
+  string time_end = 3; // only for USER_DEFINED, format: 20241203
+}
+
+message SearchCrawlRequest {
+  string query = 1;
+  SearchSource search_source = 2;
+  string source = 3;
+  TimeRange time_range = 4;
+}
+
+message SearchItem {
+   string url = 1;
+   string title = 2;
+   string summary = 3;
+   int32 pos = 4;
+   string query = 5;
+   repeated string image_list = 6;
+   string publish_time = 7;
+};
+
+message SearchCrawlResponse {
+  RetCode ret_code = 1;
+  SearchCrawlRequest request = 2;
+  repeated SearchItem search_item_list = 3;
+}
+
+message UrlNormalizerRequest {
+  repeated string urls = 1;
+}
+
+message UrlNormalizerResponse {
+  repeated string normalized_urls = 1;
+}
+
+service CrawlService {
+  rpc Download(CrawlRequest) returns (CrawlResponse);
+}
+
+service SearchCrawlService {
+  rpc DownloadSearchPage(SearchCrawlRequest) returns (SearchCrawlResponse);
+}
+
+service UrlNormalizerService {
+  rpc Normalize(UrlNormalizerRequest) returns (UrlNormalizerResponse);
+}

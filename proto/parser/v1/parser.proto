@@ -1,0 +1,92 @@
+syntax = "proto3";
+option cc_generic_services = true;
+option go_package = "example.com/goliath/parser/v1;parserv1";
+
+package yuanshi.parser;
+
+enum OuputFormat {
+  MARKDOWN = 0; // 核心正文markdown格式
+  SOURCE_TEXT = 1; // 原始文本&链接&图片
+  SOURCE_HTML = 2; // 原始网页
+}
+
+message ParseRequest {
+  string url = 1;
+  bytes content = 2;
+  string encoding = 3;
+  int64 crawl_timestamp = 4;
+  string query = 5;
+  string source = 6;
+  bool img_in_content = 7;
+  OuputFormat output_format = 8;
+}
+
+enum RetCode {
+  SUCCESS = 0;
+  BUILD_TREE_FAILED = 1;
+  PARSE_FAILED = 2;
+  EMPTY_CONTENT = 3;
+  GZIP_DECOMPRESS_FAILED = 4;
+};
+
+enum ParseMethod {
+  XPATH = 0;
+  STRATEGY = 1;
+  FALLBACK = 2; // 兜底
+  OFFLINE = 3; // 离线cache
+};
+
+message ParseContentResponse {
+  RetCode ret_code = 1;
+  bytes content = 2;
+  string url = 3;
+  bytes title = 4;
+  bytes head_title = 5;
+  string publish_time = 6;
+  repeated string image_list = 7;
+  repeated string video_list = 8;
+  repeated int32 position_list = 9; // start from 0
+  int64 time_cost = 10;
+  ParseMethod parse_method = 11;
+  bool should_cache = 12;
+  string hostname = 13;
+  string hostlogo = 14;
+}
+
+// for online service
+message LinkItem {
+  string url = 1;
+  string anchor = 2;
+}
+
+message SearchLink {
+  string query = 1;
+  string url = 2; // maybe normalzied
+  string title = 3;
+  string summary = 4;
+  int32 pos = 5;
+  repeated string image_list = 6;
+  string refer_url = 7;
+  string extra = 8;
+  string publish_time = 9;
+  string source_url = 10; // no normalized
+}
+
+message ParseLinksResponse {
+  RetCode ret_code = 1;
+  repeated LinkItem link_list = 2;
+}
+
+message ParseSearchLinksResponse {
+  RetCode ret_code = 1;
+  repeated SearchLink search_link_list = 2;
+}
+
+service WebParserService {
+  // 解析正文
+  rpc ParseContent(ParseRequest) returns (ParseContentResponse);
+  // 解析链接
+  rpc ParseLinks(ParseRequest) returns (ParseLinksResponse);
+  // 解析搜索链接
+  rpc ParseSearchLinks(ParseRequest) returns (ParseSearchLinksResponse);
+}
