@@ -11,6 +11,8 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v2/vo"
+	prom "github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	redis "github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -18,12 +20,22 @@ import (
 	pb "example.com/goliath/proto/goliath/v1"
 	cpb "example.com/goliath/proto/crawler/v1"
 	ppb "example.com/goliath/proto/parser/v1"
+)
 
-	//"example.com/goliath/internal/config"
+var (
+	timer = promauto.NewHistogramVec(prom.HistogramOpts{
+		Name:	"GoliathTimer",
+		Help:	"Goliath Timer",
+	}, []string{"tag", "extra1", "extra2", "extra3", "extra4"})
+
+	counter = promauto.NewCounterVec(prom.CounterOpts{
+		Name:	"GoliathCounter",
+		Help:	"Goliath Counter",
+	}, []string{"tag", "extra1", "extra2", "extra3", "extra4"})
 )
 
 type Executor struct {
-	crawlerConn	*grpc.ClientConn
+	crawlerConns	map[string]*grpc.ClientConn
 	parserConn	*grpc.ClientConn
 	redisClient	*redis.Client
 	nacosClient	config_client.IConfigClient
@@ -58,13 +70,22 @@ func initNacosConfigClient() config_client.IConfigClient {
 }
 
 func NewExecutor() *Executor {
-	crawlerConn, err := grpc.Dial("10.3.0.149:9023",
+	bjCrawlerConn, err := grpc.Dial("10.3.0.149:9023",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
 		grpc.WithInitialWindowSize(10 * 1024 * 1024))
 	if err != nil {
-		glog.Fatal("Failed to create conn {err}")
+		glog.Fatal("Failed to create grpc connection: ", err)
 	}
+
+	tokCrawlerConn, err := grpc.Dial("lb-ewshi9g6-uoztfn5ya8bvpm20.clb.na-siliconvalley.tencentclb.com:9023",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
+		grpc.WithInitialWindowSize(10 * 1024 * 1024))
+	if err != nil {
+		glog.Fatal("Failed to create grpc connection: ", err)
+	}
+
 	parserConn, err := grpc.Dial("10.3.128.4:9023",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
@@ -104,7 +125,10 @@ func NewExecutor() *Executor {
 		glog.Fatal(err)
 	}
 	return &Executor{
-		crawlerConn:	crawlerConn,
+		crawlerConns:	map[string]*grpc.ClientConn {
+			"BJ":	bjCrawlerConn,
+			"TOK":	tokCrawlerConn,
+		},
 		parserConn:	parserConn,
 		redisClient:	redisClient,
 		nacosClient:	nacosClient,
@@ -117,15 +141,19 @@ func (e *Executor) readFromCache(url string) string {
 	redisValue, err := e.redisClient.Get(context.Background(), globalRedisKey).Result()
 	if err == nil {
 		glog.Info("Global cache hit: ", globalRedisKey)
+		counter.WithLabelValues("global_cache", "hit", "", "", "").Inc()
 		return redisValue
 	}
+	counter.WithLabelValues("global_cache", "miss", "", "", "").Inc()
 	glog.Info("Global cache miss: ", globalRedisKey)
 	realtimeRedisKey := fmt.Sprintf("crawl_rt:%d", urlHash)
 	redisValue, err = e.redisClient.Get(context.Background(), realtimeRedisKey).Result()
 	if err == nil {
 		glog.Info("Realtime cache hit: ", realtimeRedisKey)
+		counter.WithLabelValues("realtime_cache", "hit", "", "", "").Inc()
 		return redisValue
 	}
+	counter.WithLabelValues("realtime_cache", "miss", "", "", "").Inc()
 	glog.Info("Realtime cache miss: ", globalRedisKey)
 	return ""
 }
@@ -144,7 +172,102 @@ func (e *Executor) convertParseResult(pr *ppb.ParseContentResponse) *pb.Retrieve
 	}
 }
 
-func (e *Executor) Retrieve(req *pb.RetrieveRequest) *pb.RetrieveResponse {
+func contextCounter(ctx context.Context, tag string, extra1 string, extra2 string) prom.Counter {
+	return counter.WithLabelValues(
+		tag,
+		extra1,
+		extra2,
+		ctx.Value(ctxDomainKey).(string),
+		ctx.Value(ctxBizDefKey).(string))
+}
+
+func contextObserver(ctx context.Context, tag string, extra1 string, extra2 string) prom.Observer {
+	return timer.WithLabelValues(
+		tag,
+		extra1,
+		extra2,
+		ctx.Value(ctxDomainKey).(string),
+		ctx.Value(ctxBizDefKey).(string))
+}
+
+func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerRegion string, done chan interface{}) {
+	startTime := time.Now()
+
+	c := cpb.NewCrawlServiceClient(e.crawlerConns[crawlerRegion])
+	innerCtx, cancel := context.WithTimeout(ctx, 15 * time.Second)
+	defer cancel()
+
+	r, err := c.Download(innerCtx, &cpb.CrawlRequest{
+		Url:		req.Url,
+		RequestType:	cpb.RequestType_GET,
+		UaType:		cpb.UAType_PC,
+		TaskInfo:	&cpb.TaskInfo{
+			TaskName:	req.BizDef,
+		},
+	})
+
+	if err != nil {
+		contextObserver(ctx, "crawl", "error", "").Observe(time.Since(startTime).Seconds())
+		err = fmt.Errorf("Crawl failed: Url = %s, err = %v", req.Url, err)
+		done <- err
+		return
+	}
+
+	if r.ErrCode != cpb.ERROR_CODE_SUCCESS {
+		contextObserver(ctx, "crawl", fmt.Sprintf("error_%s", r.ErrCode), "").Observe(time.Since(startTime).Seconds())
+		err = fmt.Errorf("Crawl failed: Url = %s, ErrCode = %d", req.Url, r.ErrCode)
+		done <- err
+		return
+	}
+
+	if r.StatusCode != 200 {
+		contextObserver(ctx, "crawl", fmt.Sprintf("error_http_%d", r.StatusCode), "").Observe(time.Since(startTime).Seconds())
+		err = fmt.Errorf("Crawl failed: Url = %s, StatusCode = %d", req.Url, r.StatusCode)
+		done <- err
+		return
+	}
+
+	if len(r.Content) == 0 {
+		contextObserver(ctx, "crawl", "empty_content", "").Observe(time.Since(startTime).Seconds())
+		err = fmt.Errorf("Crawl failed no content: Url = %s")
+		done <- err
+		return
+	}
+
+	contextObserver(ctx, "crawl", "success", "").Observe(time.Since(startTime).Seconds())
+	done <- r
+}
+
+func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, crawled *cpb.CrawlResponse, done chan interface{}) {
+	startTime := time.Now()
+	c := ppb.NewWebParserServiceClient(e.parserConn)
+	innerCtx, cancel := context.WithTimeout(ctx, 1 * time.Second)
+	defer cancel()
+
+	r, err := c.ParseContent(innerCtx, &ppb.ParseRequest{
+		Url:		req.Url,
+		Content:	crawled.Content,
+	})
+
+	if err != nil {
+		contextObserver(ctx, "parse", "error", "").Observe(time.Since(startTime).Seconds())
+		err = fmt.Errorf("Parse failed, Url = %s,  err: %v", req.Url, err)
+		done <- err
+		glog.Error(err)
+	}
+
+	if len(r.Content) == 0 {
+		contextObserver(ctx, "parse", "empty_content", "").Observe(time.Since(startTime).Seconds())
+		err = fmt.Errorf("Parse failed no content: Url = %s")
+		done <- err
+		return
+	}
+
+	contextObserver(ctx, "parse", "success", "").Observe(time.Since(startTime).Seconds())
+	done <- r
+}
+
+func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
 	glog.Info(fmt.Sprintf("Retrieve: %s", req.Url))
 	defer glog.Flush()
 
@@ -159,47 +282,44 @@ func (e *Executor) Retrieve(req *pb.RetrieveRequest) *pb.RetrieveResponse {
 		glog.Error("Cache content not in protobuf format, maybe corrupted! Url = ", req.Url)
 	}
 
-	c := cpb.NewCrawlServiceClient(e.crawlerConn)
-	ctx, cancel := context.WithTimeout(context.Background(), 10 * time.Second)
-	defer cancel()
+	// TODO: parallel crawl from multiple site
+	region := "BJ"
+	if req.ForeignHint {
+		region = "TOK"
+	}
+	crawlDone := make(chan interface{})
+	defer close(crawlDone)
+	go e.invokeCrawl(ctx, req, region, crawlDone)
+	d := <-crawlDone
 
-	r, err := c.Download(ctx, &cpb.CrawlRequest{
-		Url:		req.Url,
-	})
-
-	if err != nil {
-		glog.Fatal(err)
+	crawled, ok := d.(*cpb.CrawlResponse)
+	if !ok {
+		err, ok := d.(error)
+		if ok {
+			glog.Error(err)
+			return &pb.RetrieveResponse{
+				DebugString:	err.Error(),
+			}
+		} else {
+			return &pb.RetrieveResponse{}
+		}
 	}
 
-	if r.Content == nil || len(r.Content) == 0 {
-		glog.Error("No content returned")
-		glog.Error(r)
+	if crawled.Content == nil || len(crawled.Content) == 0 {
 		return &pb.RetrieveResponse{}
 	}
-	glog.Info(r.Content)
 
-	c2 := ppb.NewWebParserServiceClient(e.parserConn)
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 10 * time.Second)
-	defer cancel2()
-
-	r2, err2 := c2.ParseContent(ctx2, &ppb.ParseRequest{
-		Url:		req.Url,
-		Content:	r.Content,
-	})
-
-	if err2 != nil {
-		glog.Fatal(err2)
-	}
-
-	if r2.Content == nil || len(r2.Content) == 0 {
-		glog.Error("No content!")
+	parseDone := make(chan interface{})
+	defer close(parseDone)
+	go e.invokeParse(ctx, req, crawled, parseDone)
+	parsed := (<-parseDone).(*ppb.ParseContentResponse)
+	if parsed.Content == nil || len(parsed.Content) == 0 {
 		return &pb.RetrieveResponse{}
 	}
-	glog.Info(r2.Content)
 
-	return e.convertParseResult(r2)
+	return e.convertParseResult(parsed)
 }
 
-func (e *Executor) Search(req * pb.SearchRequest) *pb.SearchResponse {
+func (e *Executor) Search(ctx context.Context, req * pb.SearchRequest) *pb.SearchResponse {
 	return nil
 }

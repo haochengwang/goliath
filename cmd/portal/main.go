@@ -6,10 +6,6 @@ import (
 	"net"
 	"net/http"
 
-	//"runtime/pprof"
-	//"os"
-	//"time"
-
 	"github.com/golang/glog"
         "github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
@@ -29,15 +25,16 @@ func newServer() *server {
 }
 
 func (s *server) Retrieve(ctx context.Context, req *pb.RetrieveRequest) (*pb.RetrieveResponse, error) {
-	return s.executor.Retrieve(req), nil
+	return s.executor.Retrieve(ctx, req), nil
 }
 
 func (s *server) Search(ctx context.Context, req *pb.SearchRequest) (*pb.SearchResponse, error) {
-	return s.executor.Search(req), nil
+	return s.executor.Search(ctx, req), nil
 }
 
 func main() {
 	flag.Parse()
+
 	glog.Info("Initializing Goliath Portal...")
 	glog.Info("  ________       .__  .__        __  .__     ")
  	glog.Info(" /  _____/  ____ |  | |__|____ _/  |_|  |__  ")
@@ -53,7 +50,7 @@ func main() {
 	}()
 
 	glog.Info("Initializing Executors...")
-	s := grpc.NewServer()
+	s := grpc.NewServer(grpc.UnaryInterceptor(exec.GoliathInterceptor))
 	lis, _ := net.Listen("tcp", ":9023")
 	sv := newServer()
 	pb.RegisterGoliathPortalServer(s, sv)

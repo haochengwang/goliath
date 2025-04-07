@@ -1,1 +1,1 @@
-grpcurl -import-path ./proto -proto ./proto/goliath/v1/goliath.proto -plaintext -d '{"url": "http://www.sohu.com/"}' 127.0.0.1:9023 goliath.GoliathPortal.Retrieve
+grpcurl -import-path ./proto -proto ./proto/goliath/v1/goliath.proto -plaintext -d '{"biz_def": "test", "foreign_hint": true, "url": "http://www.google.com/"}' 10.3.32.36:9023 goliath.GoliathPortal.Retrieve
