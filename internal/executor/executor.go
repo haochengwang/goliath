@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
+	//"example.com/goliath/internal/utils"
 	pb "example.com/goliath/proto/goliath/v1"
 	cpb "example.com/goliath/proto/crawler/v1"
 	ppb "example.com/goliath/proto/parser/v1"
@@ -36,7 +37,8 @@ var (
 
 type Executor struct {
 	crawlerConns	map[string]*grpc.ClientConn
-	parserConn	*grpc.ClientConn
+	searchConns	map[string]*grpc.ClientConn
+	parserConns	map[string]*grpc.ClientConn
 	redisClient	*redis.Client
 	nacosClient	config_client.IConfigClient
 }
@@ -73,7 +75,8 @@ func NewExecutor() *Executor {
 	bjCrawlerConn, err := grpc.Dial("10.3.0.149:9023",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
-		grpc.WithInitialWindowSize(10 * 1024 * 1024))
+		grpc.WithInitialWindowSize(10 * 1024 * 1024),
+		grpc.WithMaxMsgSize(10 * 1024 * 1024))
 	if err != nil {
 		glog.Fatal("Failed to create grpc connection: ", err)
 	}
@@ -81,18 +84,39 @@ func NewExecutor() *Executor {
 	tokCrawlerConn, err := grpc.Dial("lb-ewshi9g6-uoztfn5ya8bvpm20.clb.na-siliconvalley.tencentclb.com:9023",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
+		grpc.WithInitialWindowSize(10 * 1024 * 1024),
+		grpc.WithMaxMsgSize(10 * 1024 * 1024))
+	if err != nil {
+		glog.Fatal("Failed to create grpc connection: ", err)
+	}
+
+	bjSearchConn, err := grpc.Dial("10.3.0.149:9023",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
 		grpc.WithInitialWindowSize(10 * 1024 * 1024))
 	if err != nil {
 		glog.Fatal("Failed to create grpc connection: ", err)
 	}
 
-	parserConn, err := grpc.Dial("10.3.128.4:9023",
+	bjParserConn, err := grpc.Dial("10.3.128.4:9023",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
-		grpc.WithInitialWindowSize(10 * 1024 * 1024))
+		grpc.WithInitialWindowSize(10 * 1024 * 1024),
+		grpc.FailOnNonTempDialError(true))
 	if err != nil {
 		glog.Fatal("Failed to create conn {err}")
 	}
+
+	// For pdf and bilibili
+	bjMediaParserConn, err := grpc.Dial("10.3.16.19:50056",
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
+		grpc.WithInitialWindowSize(10 * 1024 * 1024),
+		grpc.FailOnNonTempDialError(true))
+	if err != nil {
+		glog.Fatal("Failed to create conn {err}")
+	}
+
 
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:		"10.3.0.103:6379",
@@ -129,7 +153,13 @@ func NewExecutor() *Executor {
 			"BJ":	bjCrawlerConn,
 			"TOK":	tokCrawlerConn,
 		},
-		parserConn:	parserConn,
+		searchConns:	map[string]*grpc.ClientConn {
+			"BJ":	bjSearchConn,
+		},
+		parserConns:	map[string]*grpc.ClientConn {
+			"BJ":		bjParserConn,
+			"BJ-MED":	bjMediaParserConn,
+		},
 		redisClient:	redisClient,
 		nacosClient:	nacosClient,
 	}
@@ -162,12 +192,19 @@ func (e *Executor) convertParseResult(pr *ppb.ParseContentResponse) *pb.Retrieve
 	if pr == nil {
 		return nil
 	}
+
+	content := pr.Content
+	//content, err := utils.GzipDecompress(pr.Content)
+	//if err != nil {
+	//.	return &pb.RetrieveResponse {
+	//		DebugString:	fmt.Sprintf("Faield to decompress content; %s", err),
+	//	}
+	//}
+
 	return &pb.RetrieveResponse {
-		Result:	[]*pb.RetrieveResult {
-			&pb.RetrieveResult {
-				Url:		pr.Url,
-				Content:	pr.Content,
-			},
+		Result:	&pb.RetrieveResult {
+			Url:		pr.Url,
+			Content:	content,
 		},
 	}
 }
@@ -197,10 +234,18 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest, cra
 	innerCtx, cancel := context.WithTimeout(ctx, 15 * time.Second)
 	defer cancel()
 
+	var ctype cpb.CrawlType
+	if req.RetrieveType == pb.RetrieveType_IMAGE {
+		ctype = cpb.CrawlType_IMAGE
+	} else {
+		ctype = cpb.CrawlType_HTML
+	}
+
 	r, err := c.Download(innerCtx, &cpb.CrawlRequest{
 		Url:		req.Url,
 		RequestType:	cpb.RequestType_GET,
 		UaType:		cpb.UAType_PC,
+		CrawlType:	ctype,
 		TaskInfo:	&cpb.TaskInfo{
 			TaskName:	req.BizDef,
 		},
@@ -240,12 +285,26 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest, cra
 
 func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, crawled *cpb.CrawlResponse, done chan interface{}) {
 	startTime := time.Now()
-	c := ppb.NewWebParserServiceClient(e.parserConn)
-	innerCtx, cancel := context.WithTimeout(ctx, 1 * time.Second)
+
+	var c ppb.WebParserServiceClient
+	var pm ppb.ParseMethod
+	if req.RetrieveType == pb.RetrieveType_PDF {
+		c = ppb.NewWebParserServiceClient(e.parserConns["BJ-MED"])
+		pm = ppb.ParseMethod_PDF
+	} else if req.RetrieveType == pb.RetrieveType_VIDEO_SUMMARY {
+		c = ppb.NewWebParserServiceClient(e.parserConns["BJ-MED"])
+		pm = ppb.ParseMethod_BILI
+	} else {
+		c = ppb.NewWebParserServiceClient(e.parserConns["BJ"])
+		pm = ppb.ParseMethod_XPATH
+	}
+
+	innerCtx, cancel := context.WithTimeout(ctx, 10 * time.Second)
 	defer cancel()
 
 	r, err := c.ParseContent(innerCtx, &ppb.ParseRequest{
 		Url:		req.Url,
+		ParseMethod:	pm,
 		Content:	crawled.Content,
 	})
 
@@ -254,17 +313,66 @@ func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, cra
 		err = fmt.Errorf("Parse failed, Url = %s,  err: %v", req.Url, err)
 		done <- err
 		glog.Error(err)
+		return
 	}
 
 	if len(r.Content) == 0 {
 		contextObserver(ctx, "parse", "empty_content", "").Observe(time.Since(startTime).Seconds())
 		err = fmt.Errorf("Parse failed no content: Url = %s")
 		done <- err
+		glog.Error(err)
 		return
 	}
 
 	contextObserver(ctx, "parse", "success", "").Observe(time.Since(startTime).Seconds())
 	done <- r
+}
+
+func (e *Executor) invokeSearch(ctx context.Context, req *pb.SearchRequest, region string, done chan interface{}) {
+	startTime := time.Now()
+	c := cpb.NewSearchCrawlServiceClient(e.searchConns[region])
+	innerCtx, cancel := context.WithTimeout(ctx, 10 * time.Second)
+	defer cancel()
+
+	r, err := c.DownloadSearchPage(innerCtx, &cpb.SearchCrawlRequest{
+		Query:		req.Query,
+	})
+
+	if err != nil {
+		contextObserver(ctx, "search", "error", "").Observe(time.Since(startTime).Seconds())
+		err = fmt.Errorf("Search failed, Query = %s, err = %v", req.Query, err)
+		done <- err
+		glog.Error(err)
+		return
+	}
+
+	contextObserver(ctx, "search", "success", "").Observe(time.Since(startTime).Seconds())
+	done <- r
+}
+
+func (e *Executor) convertSearchItem(t *cpb.SearchItem) *pb.SearchItem {
+	return &pb.SearchItem {
+		Query:		t.Query,
+		Pos:		t.Pos,
+		Title:		t.Title,
+		Url:		t.Url,
+		Summary:	t.Summary,
+		ImageList:	t.ImageList,
+		
+	}
+}
+
+func (e *Executor) convertSearchResult(r *cpb.SearchCrawlResponse) *pb.SearchResponse {
+	s := make([]*pb.SearchItem, len(r.SearchItemList))
+	for i, item := range(r.SearchItemList) {
+		s[i] = e.convertSearchItem(item)
+	}
+	return &pb.SearchResponse {
+		RequestId:	"1",
+		RetCode:	0,
+		SearchItems:	s,
+		DebugString:	"",
+	}
 }
 
 func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
@@ -301,7 +409,9 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 				DebugString:	err.Error(),
 			}
 		} else {
-			return &pb.RetrieveResponse{}
+			return &pb.RetrieveResponse{
+				RetCode:	-1,
+			}
 		}
 	}
 
@@ -312,14 +422,49 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 	parseDone := make(chan interface{})
 	defer close(parseDone)
 	go e.invokeParse(ctx, req, crawled, parseDone)
-	parsed := (<-parseDone).(*ppb.ParseContentResponse)
-	if parsed.Content == nil || len(parsed.Content) == 0 {
-		return &pb.RetrieveResponse{}
+	p := <-parseDone
+	parsed, ok := p.(*ppb.ParseContentResponse)
+	if !ok {
+		err, ok := p.(error)
+		if ok {
+			glog.Error(err)
+			return &pb.RetrieveResponse{
+				DebugString: err.Error(),
+			}
+		} else {
+			glog.Error(parsed)
+			return &pb.RetrieveResponse{
+				RetCode:	-1,
+			}
+		}
 	}
 
 	return e.convertParseResult(parsed)
 }
 
 func (e *Executor) Search(ctx context.Context, req * pb.SearchRequest) *pb.SearchResponse {
-	return nil
+	glog.Info(fmt.Sprintf("Search: %s", req.Query))
+	defer glog.Flush()
+
+	region := "BJ"
+	if req.ForeignHint {
+		region = "TOK"
+	}
+
+	searchDone := make(chan interface{})
+	defer close(searchDone)
+	go e.invokeSearch(ctx, req, region, searchDone)
+	r := <-searchDone
+	if searched, ok := r.(*cpb.SearchCrawlResponse); ok {
+		return e.convertSearchResult(searched)
+	} else if err, ok := r.(error); ok {
+		return &pb.SearchResponse{
+			RetCode:	-1,
+			DebugString:	err.Error(),
+		}
+	} else {
+		return &pb.SearchResponse{
+			RetCode:	-1,
+		}
+	}
 }

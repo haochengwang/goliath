@@ -5,7 +5,7 @@ option go_package = "example.com/goliath/parser/v1;parserv1";
 package yuanshi.parser;
 
 enum OuputFormat {
-  MARKDOWN = 0; // 核心正文markdown格式
+  MARKDOWN = 0; // 核心正文 markdown 格式
   SOURCE_TEXT = 1; // 原始文本&链接&图片
   SOURCE_HTML = 2; // 原始网页
 }
@@ -19,6 +19,7 @@ message ParseRequest {
   string source = 6;
   bool img_in_content = 7;
   OuputFormat output_format = 8;
+  ParseMethod parse_method = 9;
 }
 
 enum RetCode {
@@ -29,11 +30,27 @@ enum RetCode {
   GZIP_DECOMPRESS_FAILED = 4;
 };
 
+enum TurnDownRetCode {
+  OK = 0;
+  TURNDOWN_FAILED = 1;
+  EMPTY = 2;
+  INTERNAL_ERR = 3;
+};
 enum ParseMethod {
   XPATH = 0;
   STRATEGY = 1;
   FALLBACK = 2; // 兜底
   OFFLINE = 3; // 离线cache
+  TR      = 4; // 返回markdown
+  MAGIC   = 5; // 返回html
+  PDF     = 6; // PDF
+  BILI     = 7; // VIDEO
+};
+
+enum TurndownMethod {
+  RAW = 0;
+  PARSED = 1;
+  AUTO = 2;
 };
 
 message ParseContentResponse {
@@ -49,8 +66,25 @@ message ParseContentResponse {
   int64 time_cost = 10;
   ParseMethod parse_method = 11;
   bool should_cache = 12;
-  string hostname = 13;
-  string hostlogo = 14;
+  string author = 13;
+  string location = 14;
+}
+
+message MarkdownRequest {
+  string url = 1;
+  ParseContentResponse parsed  = 2;
+  string raw_html = 3;
+  float  use_raw_ratio = 4;
+  TurndownMethod turndown_method = 5;
+  int64  convert_timestamp = 6;
+}
+
+message MarkdownResponse {
+  MarkdownRequest request = 1;
+  string markdown_title = 2;
+  string markdown_content = 3;
+  string markdown_pub_time = 4;
+  int64 time_cost_ms = 5;
 }
 
 // for online service
@@ -61,15 +95,11 @@ message LinkItem {
 
 message SearchLink {
   string query = 1;
-  string url = 2; // maybe normalzied
+  string url = 2;
   string title = 3;
   string summary = 4;
   int32 pos = 5;
   repeated string image_list = 6;
-  string refer_url = 7;
-  string extra = 8;
-  string publish_time = 9;
-  string source_url = 10; // no normalized
 }
 
 message ParseLinksResponse {
@@ -82,6 +112,43 @@ message ParseSearchLinksResponse {
   repeated SearchLink search_link_list = 2;
 }
 
+message DeepExtractReq {
+    string url = 1;          // url
+    string index_url = 2;    // refer url
+    bytes title = 3;         // title, default ""
+    bytes content = 4;       // content, default
+    int32 item_type = 5;     // 999 聊后搬
+    string source = 6;       // 来源，无则写域名
+    string tag = 7;          // 分类
+    string host = 8;         // url 域名
+    string author = 9;       // 作者
+    int32 dtype = 10;        // 默认0
+    int32 item_dtype = 11;   // 网页下载类型
+    string user_agent = 12;  // 抓取 ua
+    int64 pub_time_s = 13;   // 发布时间
+    int64 req_sent_ms = 14;  // 发出请求时间
+}
+
+message DeepExtractResponse {
+    RetCode ret_code = 1;            // 返回码
+    string url = 2;                  // url
+    bytes title = 3;                 // 抽取标题
+    string host = 4;                 // host
+    int32 dtype = 5;                 // 页面下载方式
+    bytes content = 6;               // 正文
+    repeated string image_list = 7;  // 原图列表
+    bytes markdown_text = 8;         // markdown_text
+    bytes raw_page = 9;              // 网页内容
+    string origin = 10;              // 兼容小红书
+    int64 pub_time_s = 11;           // 发布时间
+    int64 crawled_ms = 12;           // 抓取时间
+    string tag = 13;                 // 分类
+    string source = 14;              // 来源
+    string index_url = 15;           // refer url
+    int32 item_type = 16;            // item_type 聊后搬999
+    int32 content_len = 17;          // content 长度
+}
+
 service WebParserService {
   // 解析正文
   rpc ParseContent(ParseRequest) returns (ParseContentResponse);
@@ -89,4 +156,10 @@ service WebParserService {
   rpc ParseLinks(ParseRequest) returns (ParseLinksResponse);
   // 解析搜索链接
   rpc ParseSearchLinks(ParseRequest) returns (ParseSearchLinksResponse);
+
+  // markdown service
+  rpc Turndown(MarkdownRequest) returns (MarkdownResponse);
+
+  // deep extract
+  rpc DeepExtract(DeepExtractReq) returns (DeepExtractResponse);
 }
