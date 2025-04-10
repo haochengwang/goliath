@@ -188,7 +188,7 @@ func (e *Executor) readFromCache(url string) string {
 	return ""
 }
 
-func (e *Executor) convertParseResult(pr *ppb.ParseContentResponse) *pb.RetrieveResponse {
+func (e *Executor) convertParseResult(ctx context.Context, pr *ppb.ParseContentResponse) *pb.RetrieveResponse {
 	if pr == nil {
 		return nil
 	}
@@ -350,7 +350,7 @@ func (e *Executor) invokeSearch(ctx context.Context, req *pb.SearchRequest, regi
 	done <- r
 }
 
-func (e *Executor) convertSearchItem(t *cpb.SearchItem) *pb.SearchItem {
+func (e *Executor) convertSearchItem(ctx context.Context, t *cpb.SearchItem) *pb.SearchItem {
 	return &pb.SearchItem {
 		Query:		t.Query,
 		Pos:		t.Pos,
@@ -358,14 +358,13 @@ func (e *Executor) convertSearchItem(t *cpb.SearchItem) *pb.SearchItem {
 		Url:		t.Url,
 		Summary:	t.Summary,
 		ImageList:	t.ImageList,
-		
 	}
 }
 
-func (e *Executor) convertSearchResult(r *cpb.SearchCrawlResponse) *pb.SearchResponse {
+func (e *Executor) convertSearchResult(ctx context.Context, r *cpb.SearchCrawlResponse) *pb.SearchResponse {
 	s := make([]*pb.SearchItem, len(r.SearchItemList))
 	for i, item := range(r.SearchItemList) {
-		s[i] = e.convertSearchItem(item)
+		s[i] = e.convertSearchItem(ctx, item)
 	}
 	return &pb.SearchResponse {
 		RequestId:	"1",
@@ -384,7 +383,7 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 		parseResult := &ppb.ParseContentResponse{}
 		err := proto.Unmarshal([]byte(cacheContent), parseResult)
 		if err == nil {
-			return e.convertParseResult(parseResult)
+			return e.convertParseResult(ctx, parseResult)
 		}
 
 		glog.Error("Cache content not in protobuf format, maybe corrupted! Url = ", req.Url)
@@ -439,7 +438,7 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 		}
 	}
 
-	return e.convertParseResult(parsed)
+	return e.convertParseResult(ctx, parsed)
 }
 
 func (e *Executor) Search(ctx context.Context, req * pb.SearchRequest) *pb.SearchResponse {
@@ -456,7 +455,7 @@ func (e *Executor) Search(ctx context.Context, req * pb.SearchRequest) *pb.Searc
 	go e.invokeSearch(ctx, req, region, searchDone)
 	r := <-searchDone
 	if searched, ok := r.(*cpb.SearchCrawlResponse); ok {
-		return e.convertSearchResult(searched)
+		return e.convertSearchResult(ctx, searched)
 	} else if err, ok := r.(error); ok {
 		return &pb.SearchResponse{
 			RetCode:	-1,
