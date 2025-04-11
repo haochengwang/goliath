@@ -12,14 +12,21 @@ import (
 )
 
 var (
+	ctxReqIdKey = "reqid"
 	ctxDomainKey = "domain"
 	ctxBizDefKey = "bizdef"
 )
 
+func generateReqId() string {
+	return ""
+}
+
 func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	bizdef := ""
+	reqId := ""
 	if r, ok := req.(*pb.RetrieveRequest); ok {
 		bizdef = r.BizDef
+		reqId = r.RequestId
 
     		fmt.Println(r.String())
 		domain, err := utils.ExtractDomain(r.Url)
@@ -30,11 +37,15 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 	}
 	if r, ok := req.(*pb.SearchRequest); ok {
 		bizdef = r.BizDef
+		reqId = r.RequestId
 	}
 	if len(bizdef) == 0 {
 		return nil, status.Error(codes.Unauthenticated, "No biz_def")
 	}
-
+	if len(reqId) == 0 {
+		reqId = generateReqId()
+	}
 	ctx = context.WithValue(ctx, ctxBizDefKey, bizdef)
+	ctx = context.WithValue(ctx, ctxReqIdKey, reqId)
 	return handler(ctx, req)
 }

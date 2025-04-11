@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/golang/glog"
@@ -14,6 +15,7 @@ import (
 	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	redis "github.com/redis/go-redis/v9"
+	"github.com/IBM/sarama"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
@@ -41,6 +43,17 @@ type Executor struct {
 	parserConns	map[string]*grpc.ClientConn
 	redisClient	*redis.Client
 	nacosClient	config_client.IConfigClient
+
+	// Kafka producer
+	kafkaProducer		sarama.SyncProducer
+
+	// Cache writer workers
+	writeCacheWaitGroup	sync.WaitGroup
+	writeCacheChan		chan *ppb.ParseContentResponse
+
+	// Kafka producer workers
+	kafkaWaitGroup		sync.WaitGroup
+	kafkaChan		chan *cpb.CrawlResponse
 }
 
 func initNacosConfigClient() config_client.IConfigClient {
@@ -58,7 +71,7 @@ func initNacosConfigClient() config_client.IConfigClient {
 		CacheDir:	"/tmp/nacos/cache",
 		LogLevel:	"debug",
 	}
-
+ 
 	configClient, err := clients.CreateConfigClient(map[string]interface{}{
 		"serverConfigs":	serverConfigs,
 		"clientConfig":		clientConfig,
@@ -148,7 +161,21 @@ func NewExecutor() *Executor {
 	if err != nil {
 		glog.Fatal(err)
 	}
-	return &Executor{
+
+	// Initialize kafka producer
+	brokers := []string{"10.3.0.23:9092"}
+	kafkaConfig := sarama.NewConfig()
+	kafkaConfig.Producer.RequiredAcks = sarama.WaitForAll
+	kafkaConfig.Producer.Retry.Max = 5
+	kafkaConfig.Producer.Return.Successes = true
+	kafkaProducer, err := sarama.NewSyncProducer(brokers, kafkaConfig)
+	if err != nil {
+		glog.Fatal(err)
+	}
+
+	writeCacheChan := make(chan *ppb.ParseContentResponse)
+	kafkaChan := make(chan *cpb.CrawlResponse)
+	e := &Executor{
 		crawlerConns:	map[string]*grpc.ClientConn {
 			"BJ":	bjCrawlerConn,
 			"TOK":	tokCrawlerConn,
@@ -160,9 +187,47 @@ func NewExecutor() *Executor {
 			"BJ":		bjParserConn,
 			"BJ-MED":	bjMediaParserConn,
 		},
-		redisClient:	redisClient,
-		nacosClient:	nacosClient,
+		redisClient:		redisClient,
+		nacosClient:		nacosClient,
+		kafkaProducer:		kafkaProducer,
+		writeCacheChan:		writeCacheChan,
+		kafkaChan:		kafkaChan,
 	}
+	writeCacheWorkerNum := 4
+	e.writeCacheWaitGroup.Add(writeCacheWorkerNum)
+
+	for range(writeCacheWorkerNum) {
+		go func() {
+			for r := range writeCacheChan {
+				e.writeToCache(r)
+			}
+
+			e.writeCacheWaitGroup.Done()
+		}()
+	}
+
+	kafkaWorkerNum := 10
+	e.kafkaWaitGroup.Add(kafkaWorkerNum)
+
+	for range(kafkaWorkerNum) {
+		go func() {
+			for r := range kafkaChan {
+				e.kafkaProduce(r)
+			}
+
+			e.kafkaWaitGroup.Done()
+		}()
+	}
+
+	return e
+}
+
+func (e *Executor) Destroy() {
+	close(e.writeCacheChan)
+	e.writeCacheWaitGroup.Wait()
+
+	close(e.kafkaChan)
+	e.kafkaWaitGroup.Wait()
 }
 
 func (e *Executor) readFromCache(url string) string {
@@ -186,6 +251,46 @@ func (e *Executor) readFromCache(url string) string {
 	counter.WithLabelValues("realtime_cache", "miss", "", "", "").Inc()
 	glog.Info("Realtime cache miss: ", globalRedisKey)
 	return ""
+}
+
+func (e *Executor) writeToCache(r *ppb.ParseContentResponse) {
+	url := r.Url
+	urlHash := city.Hash64([]byte(url))
+	realtimeRedisKey := fmt.Sprintf("crawl_rt:%d", urlHash)
+
+	data, err := proto.Marshal(r)
+	if err != nil {
+		glog.Error("Failed to marshal ParseContentResponse! ", err)
+		return
+	}
+
+	// Expiration set as the end of the day, which copies the logic of web search
+	// TODO(wanghaocheng) Need to be optimized in the future
+	_, err = e.redisClient.SetEx(context.Background(), realtimeRedisKey, data, 86400 * time.Second).Result()
+
+	if err != nil {
+		glog.Error("Error")
+	} else {
+		glog.Info("Successfully write to cache: ", realtimeRedisKey)
+	}
+}
+
+func (e *Executor) kafkaProduce(r *cpb.CrawlResponse) {
+	data, err := proto.Marshal(r)
+	if err != nil {
+		glog.Error("Failed to marshal CrawlResponse! ", err)
+		return
+	}
+	partition, offset, err := e.kafkaProducer.SendMessage(&sarama.ProducerMessage{
+		Topic:		"web_search_crawl_info",
+		Value:		sarama.StringEncoder(data),
+	})
+
+	if err != nil {
+		glog.Error("Kafka produce message error: ", err)
+	} else {
+		glog.Info("Kafka produced message: partition = ", partition, ", offset = ", offset)
+	}
 }
 
 func (e *Executor) convertParseResult(ctx context.Context, pr *ppb.ParseContentResponse) *pb.RetrieveResponse {
@@ -378,18 +483,20 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 	glog.Info(fmt.Sprintf("Retrieve: %s", req.Url))
 	defer glog.Flush()
 
-	cacheContent := e.readFromCache(req.Url)
-	if len(cacheContent) > 0 {
-		parseResult := &ppb.ParseContentResponse{}
-		err := proto.Unmarshal([]byte(cacheContent), parseResult)
-		if err == nil {
-			return e.convertParseResult(ctx, parseResult)
-		}
+	if !req.BypassCache {
+		cacheContent := e.readFromCache(req.Url)
+		if len(cacheContent) > 0 {
+			parseResult := &ppb.ParseContentResponse{}
+			err := proto.Unmarshal([]byte(cacheContent), parseResult)
+			if err == nil {
+				return e.convertParseResult(ctx, parseResult)
+			}
 
-		glog.Error("Cache content not in protobuf format, maybe corrupted! Url = ", req.Url)
+			glog.Error("Cache content not in protobuf format, maybe corrupted! Url = ", req.Url)
+		}
 	}
 
-	// TODO: parallel crawl from multiple site
+	// TODO: parallel crawl from multiple region
 	region := "BJ"
 	if req.ForeignHint {
 		region = "TOK"
@@ -414,8 +521,14 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 		}
 	}
 
+	if !req.BypassCache {
+		e.kafkaChan <- crawled
+	}
+
 	if crawled.Content == nil || len(crawled.Content) == 0 {
-		return &pb.RetrieveResponse{}
+		return &pb.RetrieveResponse{
+			RetCode:	-1,
+		}
 	}
 
 	parseDone := make(chan interface{})
@@ -436,6 +549,10 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 				RetCode:	-1,
 			}
 		}
+	}
+
+	if !req.BypassCache {
+		e.writeCacheChan <- parsed
 	}
 
 	return e.convertParseResult(ctx, parsed)

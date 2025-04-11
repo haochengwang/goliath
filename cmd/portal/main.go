@@ -53,10 +53,11 @@ func main() {
 	s := grpc.NewServer(grpc.UnaryInterceptor(exec.GoliathInterceptor))
 	lis, _ := net.Listen("tcp", ":9023")
 	sv := newServer()
+	defer sv.executor.Destroy()
 	pb.RegisterGoliathPortalServer(s, sv)
 
 	glog.Info("Service initialized.")
 	glog.Flush()
 
-	glog.Fatal(s.Serve(lis))
+	glog.Error(s.Serve(lis))
 }
