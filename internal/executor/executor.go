@@ -307,6 +307,7 @@ func (e *Executor) convertParseResult(ctx context.Context, pr *ppb.ParseContentR
 	//}
 
 	return &pb.RetrieveResponse {
+		RequestId:	ctx.Value(ctxReqIdKey).(string),
 		Result:	&pb.RetrieveResult {
 			Url:		pr.Url,
 			Content:	content,
@@ -472,7 +473,7 @@ func (e *Executor) convertSearchResult(ctx context.Context, r *cpb.SearchCrawlRe
 		s[i] = e.convertSearchItem(ctx, item)
 	}
 	return &pb.SearchResponse {
-		RequestId:	"1",
+		RequestId:	ctx.Value(ctxReqIdKey).(string),
 		RetCode:	0,
 		SearchItems:	s,
 		DebugString:	"",
@@ -575,11 +576,13 @@ func (e *Executor) Search(ctx context.Context, req * pb.SearchRequest) *pb.Searc
 		return e.convertSearchResult(ctx, searched)
 	} else if err, ok := r.(error); ok {
 		return &pb.SearchResponse{
+			RequestId:	ctx.Value(ctxReqIdKey).(string),
 			RetCode:	-1,
 			DebugString:	err.Error(),
 		}
 	} else {
 		return &pb.SearchResponse{
+			RequestId:	ctx.Value(ctxReqIdKey).(string),
 			RetCode:	-1,
 		}
 	}
