@@ -3,10 +3,11 @@ package executor
 import (
 	"context"
 	"fmt"
+	"time"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-
 	pb "example.com/goliath/proto/goliath/v1"
 	"example.com/goliath/internal/utils"
 )
@@ -18,7 +19,9 @@ var (
 )
 
 func generateReqId() string {
-	return ""
+	now := time.Now()
+	return fmt.Sprintf("%04d%02d%02d%02d%02d%02d%06d", now.Year(), now.Month(), now.Day(),
+		now.Hour(), now.Minute(), now.Second(), now.UnixNano() % 1000000)
 }
 
 func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {

@@ -298,19 +298,16 @@ func (e *Executor) convertParseResult(ctx context.Context, pr *ppb.ParseContentR
 		return nil
 	}
 
-	content := pr.Content
-	//content, err := utils.GzipDecompress(pr.Content)
-	//if err != nil {
-	//.	return &pb.RetrieveResponse {
-	//		DebugString:	fmt.Sprintf("Faield to decompress content; %s", err),
-	//	}
-	//}
-
 	return &pb.RetrieveResponse {
 		RequestId:	ctx.Value(ctxReqIdKey).(string),
 		Result:	&pb.RetrieveResult {
 			Url:		pr.Url,
-			Content:	content,
+			Title:		pr.Title,
+			HeadTitle:	pr.HeadTitle,
+			Content:	pr.Content,
+			PublishTime:	pr.PublishTime,
+			ImageList:	pr.ImageList,
+			PositionList:	pr.PositionList,
 		},
 	}
 }
@@ -412,6 +409,7 @@ func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, cra
 		Url:		req.Url,
 		ParseMethod:	pm,
 		Content:	crawled.Content,
+		ImgInContent:	req.DoImgUrlParse,
 	})
 
 	if err != nil {
