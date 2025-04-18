@@ -28,10 +28,9 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 	bizdef := ""
 	reqId := ""
 	if r, ok := req.(*pb.RetrieveRequest); ok {
-		bizdef = r.BizDef
+		bizdef = fmt.Sprintf("%s_%s", r.BizDef, r.RetrieveType.String())
 		reqId = r.RequestId
 
-    		fmt.Println(r.String())
 		domain, err := utils.ExtractDomain(r.Url)
 		if err != nil && len(domain) > 0 {
 			return nil, status.Error(codes.InvalidArgument, err.Error())
@@ -50,5 +49,14 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 	}
 	ctx = context.WithValue(ctx, ctxBizDefKey, bizdef)
 	ctx = context.WithValue(ctx, ctxReqIdKey, reqId)
-	return handler(ctx, req)
+
+	res, err := handler(ctx, req)
+	if err != nil {
+		return res, err
+	}
+
+	if r, ok := res.(*pb.RetrieveResponse); ok {
+		r.RequestId = reqId
+	}
+	return res, nil
 }
