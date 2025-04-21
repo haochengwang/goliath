@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/golang/glog"
@@ -44,6 +45,7 @@ var (
 	ERR_PARSE_EMPTY		int32 = 105
 	ERR_PARSE_FEW		int32 = 106
 	ERR_INTERNAL_ERROR	int32 = 400
+	ERR_TIMEOUT		int32 = 500
 )
 
 type Executor struct {
@@ -56,6 +58,10 @@ type Executor struct {
 	// Kafka producer
 	kafkaProducer		sarama.SyncProducer
 
+	// Global cache reader workers
+	cacheReaderWaitGroup	sync.WaitGroup
+	cacheReaderChan		chan *CacheReaderTask
+
 	// Cache writer workers
 	writeCacheWaitGroup	sync.WaitGroup
 	writeCacheChan		chan *ppb.ParseContentResponse
@@ -63,6 +69,12 @@ type Executor struct {
 	// Kafka producer workers
 	kafkaWaitGroup		sync.WaitGroup
 	kafkaChan		chan *cpb.CrawlResponse
+}
+
+type CacheReaderTask struct {
+	Key		string
+	KeyPrefix	string
+	Callback	func(string, error)
 }
 
 func initNacosConfigClient() config_client.IConfigClient {
@@ -144,6 +156,7 @@ func NewExecutor() *Executor {
 		glog.Fatal(err)
 	}
 
+	cacheReaderChan := make(chan *CacheReaderTask)
 	writeCacheChan := make(chan *ppb.ParseContentResponse)
 	kafkaChan := make(chan *cpb.CrawlResponse)
 	e := &Executor{
@@ -161,9 +174,21 @@ func NewExecutor() *Executor {
 		redisClient:		redisClient,
 		nacosClient:		nacosClient,
 		kafkaProducer:		kafkaProducer,
+		cacheReaderChan:	cacheReaderChan,
 		writeCacheChan:		writeCacheChan,
 		kafkaChan:		kafkaChan,
 	}
+	cacheReaderWorkerNum := 512
+	e.cacheReaderWaitGroup.Add(cacheReaderWorkerNum)
+	for range(cacheReaderWorkerNum) {
+		go func() {
+			for r := range cacheReaderChan {
+				e.readCache(r)
+			}
+			e.cacheReaderWaitGroup.Done()
+		}()
+	}
+
 	writeCacheWorkerNum := 4
 	e.writeCacheWaitGroup.Add(writeCacheWorkerNum)
 
@@ -194,11 +219,24 @@ func NewExecutor() *Executor {
 }
 
 func (e *Executor) Destroy() {
+	close(e.cacheReaderChan)
+	e.cacheReaderWaitGroup.Wait()
+
 	close(e.writeCacheChan)
 	e.writeCacheWaitGroup.Wait()
 
 	close(e.kafkaChan)
 	e.kafkaWaitGroup.Wait()
+}
+
+func (e *Executor) readCache(task *CacheReaderTask) {
+	startTime := time.Now()
+	defer func() {
+		elapsedSeconds := time.Since(startTime).Seconds()
+		glog.Info("Read cache cost ", elapsedSeconds, " secs")
+	}()
+	ret, err := e.redisClient.Get(context.Background(), task.Key).Result()
+	task.Callback(ret, err)
 }
 
 func (e *Executor) readFromCache(url string) string {
@@ -242,7 +280,7 @@ func (e *Executor) writeToCache(r *ppb.ParseContentResponse) {
 	if err != nil {
 		glog.Error("Error")
 	} else {
-		glog.Info("Successfully write to cache: ", realtimeRedisKey)
+		glog.Info("Successfully write to cache: ", realtimeRedisKey, ", chan len = ", len(e.writeCacheChan))
 	}
 }
 
@@ -260,7 +298,7 @@ func (e *Executor) kafkaProduce(r *cpb.CrawlResponse) {
 	if err != nil {
 		glog.Error("Kafka produce message error: ", err)
 	} else {
-		glog.Info("Kafka produced message: partition = ", partition, ", offset = ", offset)
+		glog.Info("Kafka produced message: partition = ", partition, ", offset = ", offset, ", chan len = ", len(e.kafkaChan))
 	}
 }
 
@@ -301,13 +339,14 @@ func contextObserver(ctx context.Context, tag string, extra1 string, extra2 stri
 		ctx.Value(ctxBizDefKey).(string))
 }
 
-func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerRegion string, done chan interface{}) {
+func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerRegion string) (*cpb.CrawlResponse, error) {
 	startTime := time.Now()
 
 	conn, err := createGrpcConn(e.crawlerAddrs[crawlerRegion])
 	if err != nil {
 		glog.Error("Failed to create grpc connection: ", err)
 	}
+	defer conn.Close()
 
 	c := cpb.NewCrawlServiceClient(conn)
 	innerCtx, cancel := context.WithTimeout(context.Background(), time.Duration(req.TimeoutMs) * time.Millisecond)
@@ -336,41 +375,37 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest, cra
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", "error", crawlerRegion, "").Observe(elapsedSeconds)
 		err = fmt.Errorf("Crawl failed: Url = %s, err = %v, time = %f", req.Url, err, elapsedSeconds)
-		done <- err
-		return
+		return nil, err
 	}
 
 	if r.ErrCode != cpb.ERROR_CODE_SUCCESS {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", fmt.Sprintf("error_%s", r.ErrCode), crawlerRegion, "").Observe(elapsedSeconds)
 		err = fmt.Errorf("Crawl failed: Url = %s, ErrCode = %d, time = %f", req.Url, r.ErrCode, elapsedSeconds)
-		done <- err
-		return
+		return r, err
 	}
 
 	if r.StatusCode != 200 {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", fmt.Sprintf("error_http_%d", r.StatusCode), crawlerRegion, "").Observe(elapsedSeconds)
 		err = fmt.Errorf("Crawl failed: Url = %s, StatusCode = %d, time = %f", req.Url, r.StatusCode, elapsedSeconds)
-		done <- err
-		return
+		return r, err
 	}
 
 	if len(r.Content) == 0 {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", "empty_content", crawlerRegion, "").Observe(elapsedSeconds)
 		err = fmt.Errorf("Crawl failed no content: Url = %s, time = %f", req.Url, elapsedSeconds)
-		done <- err
-		return
+		return r, err
 	}
 
 	glog.Info("Crawl succeed, Url = ", req.Url, ", crawlPod = ", r.CrawlPodIp)
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextObserver(ctx, "crawl", "success", crawlerRegion, "").Observe(elapsedSeconds)
-	done <- r
+	return r, nil
 }
 
-func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, crawled *cpb.CrawlResponse, done chan interface{}) {
+func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, crawled *cpb.CrawlResponse, parseTimeoutMs int32) (*ppb.ParseContentResponse, error) {
 	startTime := time.Now()
 
 	var pm ppb.ParseMethod
@@ -390,10 +425,11 @@ func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, cra
 	if err != nil {
 		glog.Error("Failed to create grpc connection: ", err)
 	}
+	defer conn.Close()
 
 	c := ppb.NewWebParserServiceClient(conn)
 
-	innerCtx, cancel := context.WithTimeout(ctx, 100 * time.Millisecond)
+	innerCtx, cancel := context.WithTimeout(ctx, time.Duration(parseTimeoutMs) * time.Millisecond)
 	defer cancel()
 
 	r, err := c.ParseContent(innerCtx, &ppb.ParseRequest{
@@ -406,21 +442,19 @@ func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, cra
 	if err != nil {
 		contextObserver(ctx, "parse", "error", parserRegion, "").Observe(time.Since(startTime).Seconds())
 		err = fmt.Errorf("Parse failed, Url = %s,  err: %v", req.Url, err)
-		done <- err
 		glog.Error(err)
-		return
+		return nil, err
 	}
 
 	if len(r.Content) == 0 {
 		contextObserver(ctx, "parse", "empty_content", parserRegion, "").Observe(time.Since(startTime).Seconds())
 		err = fmt.Errorf("Parse failed no content: Url = %s", req.Url)
-		done <- err
 		glog.Error(err)
-		return
+		return r, err
 	}
 
 	contextObserver(ctx, "parse", "success", parserRegion, "").Observe(time.Since(startTime).Seconds())
-	done <- r
+	return r, err
 }
 
 func (e *Executor) invokeSearch(ctx context.Context, req *pb.SearchRequest, region string, done chan interface{}) {
@@ -435,6 +469,7 @@ func (e *Executor) invokeSearch(ctx context.Context, req *pb.SearchRequest, regi
 	if err != nil {
 		glog.Error("Failed to create grpc connection: ", err)
 	}
+	defer conn.Close()
 
 	c := cpb.NewSearchCrawlServiceClient(conn)
 	innerCtx, cancel := context.WithTimeout(ctx, time.Duration(req.TimeoutMs - 100) * time.Millisecond)
@@ -480,12 +515,119 @@ func (e *Executor) convertSearchResult(ctx context.Context, r *cpb.SearchCrawlRe
 	}
 }
 
+type RetrieveStatusHolder struct {
+	globalCacheResult	atomic.Pointer[ppb.ParseContentResponse]
+	realtimeCacheResult	atomic.Pointer[ppb.ParseContentResponse]
+	asyncCacheResult	atomic.Pointer[pb.CacheEntity]
+}
+
+func (h *RetrieveStatusHolder) getFinalResult() *pb.RetrieveResult {
+	return nil
+}
+
+func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
+	var h RetrieveStatusHolder
+
+	// Process global cache
+	e.cacheReaderChan <- &CacheReaderTask{
+		Key:		fmt.Sprintf("crawl:%d", city.Hash64([]byte(req.Url))),
+		Callback:	func(ret string, err error) {
+			if err != nil {
+				glog.Error("Failed to read from global cache, Url = ", req.Url)
+				return
+			}
+
+			parseResult := &ppb.ParseContentResponse{}
+			err = proto.Unmarshal([]byte(ret), parseResult)
+			if err != nil {
+				glog.Error("Failed to unmarshal proto from global cache, Url = ", req.Url)
+				return
+			}
+			h.globalCacheResult.Store(parseResult)
+		},
+	}
+
+	// Process realtime cache
+	e.cacheReaderChan <- &CacheReaderTask{
+		Key:		fmt.Sprintf("crawl_rt:%d", city.Hash64([]byte(req.Url))),
+		Callback:	func(ret string, err error) {
+			if err != nil {
+				glog.Error("Failed to read from global cache, Url = ", req.Url)
+				return
+			}
+
+			parseResult := &ppb.ParseContentResponse{}
+			err = proto.Unmarshal([]byte(ret), parseResult)
+			if err != nil {
+				glog.Error("Failed to unmarshal proto from realtime cache, Url = ", req.Url)
+				return
+			}
+			h.realtimeCacheResult.Store(parseResult)
+
+		},
+	}
+
+	// Process async cache
+	asyncCacheChan := make(chan *pb.CacheEntity)
+	e.cacheReaderChan <- &CacheReaderTask{
+		Key:		fmt.Sprintf("H|D|%d", city.Hash64([]byte(req.Url))),
+		Callback:	func(ret string, err error) {
+			defer close(asyncCacheChan)
+			if err != nil {
+				glog.Error("Failed to read from async cache, Url = ", req.Url)
+				return
+			}
+
+			cacheEntity := &pb.CacheEntity{}
+			err = proto.Unmarshal([]byte(ret), cacheEntity)
+			if err != nil {
+				glog.Error("")
+				return
+			}
+			h.asyncCacheResult.Store(cacheEntity)
+			asyncCacheChan <- cacheEntity
+		},
+	}
+
+	crawlParseChan := make(chan int)
+	for {
+		select {
+		case ret, ok := <-asyncCacheChan:
+			if !ok {
+				asyncCacheChan = nil
+				continue
+			}
+
+			// Evaluate cache entity
+			e.doRetrieve(ctx, req)
+			glog.Info(ret)
+		case ret, ok := <-crawlParseChan:
+			if !ok {
+				crawlParseChan = nil
+				continue
+			}
+			glog.Info(ret)
+		case <-time.After(time.Duration(req.TimeoutMs - 10) * time.Millisecond):
+			// TODO
+			return nil
+		}
+	}
+}
+
+func (e *Executor) syncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
+	return e.doRetrieve(ctx, req)
+}
+
 func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
 	defer func() {
 		if r := recover(); r != nil {
 			glog.Error("Panic: ", r)
 		}
 	}()
+	return e.syncRetrieve(ctx, req)
+}
+
+func (e *Executor) doRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
 	startTime := time.Now()
 
 	glog.Info(fmt.Sprintf("Bizdef: %s, Retrieve: %s, Timeout: %d", req.BizDef, req.Url, req.TimeoutMs))
@@ -511,26 +653,13 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 	if req.ForeignHint {
 		region = "TOK"
 	}
-	crawlDone := make(chan interface{})
-	defer close(crawlDone)
-	go e.invokeCrawl(ctx, req, region, crawlDone)
-	d := <-crawlDone
-
-	crawled, ok := d.(*cpb.CrawlResponse)
-	if !ok {
-		err, ok := d.(error)
-		if ok {
-			contextObserver(ctx, "retrieve", "crawl_failed", "", "").Observe(time.Since(startTime).Seconds())
-			glog.Error(err)
-			return &pb.RetrieveResponse{
-				RetCode:	ERR_CRAWL_FAILED,
-				DebugString:	err.Error(),
-			}
-		} else {
-			contextObserver(ctx, "retrieve", "internal_err", "", "").Observe(time.Since(startTime).Seconds())
-			return &pb.RetrieveResponse{
-				RetCode:	ERR_INTERNAL_ERROR,
-			}
+	crawled, err := e.invokeCrawl(ctx, req, region)
+	if err != nil {
+		contextObserver(ctx, "retrieve", "crawl_failed", "", "").Observe(time.Since(startTime).Seconds())
+		glog.Error(err)
+		return &pb.RetrieveResponse{
+			RetCode:	ERR_CRAWL_FAILED,
+			DebugString:	err.Error(),
 		}
 	}
 
@@ -552,26 +681,19 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 		}
 	}
 
-	parseDone := make(chan interface{})
-	defer close(parseDone)
-	go e.invokeParse(ctx, req, crawled, parseDone)
-	p := <-parseDone
-	parsed, ok := p.(*ppb.ParseContentResponse)
-	if !ok {
-		err, ok := p.(error)
-		if ok {
-			contextObserver(ctx, "retrieve", "parse_failed", "", "").Observe(time.Since(startTime).Seconds())
-			glog.Error(err)
-			return &pb.RetrieveResponse{
-				RetCode:	ERR_PARSE_FAILED,
-				DebugString:	err.Error(),
-			}
-		} else {
-			contextObserver(ctx, "retrieve", "internal_err", "", "").Observe(time.Since(startTime).Seconds())
-			glog.Error(parsed)
-			return &pb.RetrieveResponse{
-				RetCode:	ERR_INTERNAL_ERROR,
-			}
+	elapsed := int32(time.Since(startTime).Milliseconds())
+	if elapsed >= req.TimeoutMs {
+		return &pb.RetrieveResponse{
+			RetCode:	ERR_TIMEOUT,
+		}
+	}
+	parsed, err := e.invokeParse(ctx, req, crawled, req.TimeoutMs - elapsed)
+	if err != nil {
+		contextObserver(ctx, "retrieve", "parse_failed", "", "").Observe(time.Since(startTime).Seconds())
+		glog.Error(err)
+		return &pb.RetrieveResponse{
+			RetCode:	ERR_PARSE_FAILED,
+			DebugString:	err.Error(),
 		}
 	}
 
