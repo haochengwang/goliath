@@ -58,13 +58,17 @@ type Executor struct {
 	// Kafka producer
 	kafkaProducer		sarama.SyncProducer
 
-	// Global cache reader workers
+	// Cache reader workers
 	cacheReaderWaitGroup	sync.WaitGroup
 	cacheReaderChan		chan *CacheReaderTask
 
 	// Cache writer workers
 	writeCacheWaitGroup	sync.WaitGroup
 	writeCacheChan		chan *ppb.ParseContentResponse
+
+	// Crawl and parse workers
+	crawlParseWaitGroup	sync.WaitGroup
+	crawlParseChan		chan *CrawlAndParseTask
 
 	// Kafka producer workers
 	kafkaWaitGroup		sync.WaitGroup
@@ -75,6 +79,12 @@ type CacheReaderTask struct {
 	Key		string
 	KeyPrefix	string
 	Callback	func(string, error)
+}
+
+type CrawlAndParseTask struct {
+	Ctx		context.Context
+	Req		*pb.RetrieveRequest
+	Callback	func(*pb.RetrieveResponse, error)
 }
 
 func initNacosConfigClient() config_client.IConfigClient {
@@ -158,6 +168,7 @@ func NewExecutor() *Executor {
 
 	cacheReaderChan := make(chan *CacheReaderTask)
 	writeCacheChan := make(chan *ppb.ParseContentResponse)
+	crawlParseChan := make(chan *CrawlAndParseTask)
 	kafkaChan := make(chan *cpb.CrawlResponse)
 	e := &Executor{
 		crawlerAddrs:	map[string]string {
@@ -176,9 +187,10 @@ func NewExecutor() *Executor {
 		kafkaProducer:		kafkaProducer,
 		cacheReaderChan:	cacheReaderChan,
 		writeCacheChan:		writeCacheChan,
+		crawlParseChan:		crawlParseChan,
 		kafkaChan:		kafkaChan,
 	}
-	cacheReaderWorkerNum := 512
+	cacheReaderWorkerNum := 64
 	e.cacheReaderWaitGroup.Add(cacheReaderWorkerNum)
 	for range(cacheReaderWorkerNum) {
 		go func() {
@@ -199,6 +211,19 @@ func NewExecutor() *Executor {
 			}
 
 			e.writeCacheWaitGroup.Done()
+		}()
+	}
+
+	crawlParseWorkerNum := 512
+	e.crawlParseWaitGroup.Add(crawlParseWorkerNum)
+
+	for range(crawlParseWorkerNum) {
+		go func() {
+			for r := range crawlParseChan {
+				e.crawlAndParse(r)
+			}
+
+			e.crawlParseWaitGroup.Done()
 		}()
 	}
 
@@ -526,6 +551,15 @@ func (h *RetrieveStatusHolder) getFinalResult() *pb.RetrieveResult {
 }
 
 func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
+	startTime := time.Now()
+	perfExtra1 := "success"
+	perfExtra2 := ""
+	perfExtra3 := ""
+	defer func() {
+		elapsedSeconds := time.Since(startTime).Seconds()
+		contextObserver(ctx, "async_retrieve", perfExtra1, perfExtra2, perfExtra3).Observe(elapsedSeconds)
+	}()
+
 	var h RetrieveStatusHolder
 
 	// Process global cache
@@ -563,7 +597,6 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				return
 			}
 			h.realtimeCacheResult.Store(parseResult)
-
 		},
 	}
 
@@ -573,15 +606,16 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		Key:		fmt.Sprintf("H|D|%d", city.Hash64([]byte(req.Url))),
 		Callback:	func(ret string, err error) {
 			defer close(asyncCacheChan)
-			if err != nil {
-				glog.Error("Failed to read from async cache, Url = ", req.Url)
+			if err != nil {  // Cache miss
+				asyncCacheChan <- nil
 				return
 			}
 
 			cacheEntity := &pb.CacheEntity{}
 			err = proto.Unmarshal([]byte(ret), cacheEntity)
 			if err != nil {
-				glog.Error("")
+				glog.Error("Failed to unmarshal protobuf for async cache, Url = ", req.Url)
+				asyncCacheChan <- nil
 				return
 			}
 			h.asyncCacheResult.Store(cacheEntity)
@@ -589,7 +623,9 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		},
 	}
 
-	crawlParseChan := make(chan int)
+	var crawlParseChan chan *pb.RetrieveResponse
+	crawlParseChan = nil
+
 	for {
 		select {
 		case ret, ok := <-asyncCacheChan:
@@ -599,19 +635,38 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 			}
 
 			// Evaluate cache entity
-			e.doRetrieve(ctx, req)
-			glog.Info(ret)
+			if ret == nil {
+				crawlParseChan = make(chan *pb.RetrieveResponse)
+				e.crawlParseChan <- &CrawlAndParseTask{
+					Ctx:	context.WithoutCancel(ctx),
+					Req:	req,
+					Callback:	func(resp *pb.RetrieveResponse, err error) {
+						defer close(crawlParseChan)
+						if err != nil {
+							crawlParseChan <- &pb.RetrieveResponse{
+							}
+						}
+						
+						crawlParseChan <- resp
+					},
+				}
+			}
 		case ret, ok := <-crawlParseChan:
 			if !ok {
 				crawlParseChan = nil
 				continue
 			}
-			glog.Info(ret)
+			return ret
 		case <-time.After(time.Duration(req.TimeoutMs - 10) * time.Millisecond):
 			// TODO
 			return nil
 		}
 	}
+}
+
+func (e *Executor) crawlAndParse(r *CrawlAndParseTask) {
+	res := e.doRetrieve(r.Ctx, r.Req)
+	r.Callback(res, nil)
 }
 
 func (e *Executor) syncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
