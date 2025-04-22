@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/golang/glog"
+	txt "github.com/linkdotnet/golang-stringbuilder"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -16,6 +18,7 @@ var (
 	ctxReqIdKey = "reqid"
 	ctxDomainKey = "domain"
 	ctxBizDefKey = "bizdef"
+	ctxDebugStrKey = "dbgstr"
 )
 
 func generateReqId() string {
@@ -27,6 +30,12 @@ func generateReqId() string {
 func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
 	bizdef := ""
 	reqId := ""
+	startTime := time.Now()
+	defer func() {
+		elapsedSeconds := time.Since(startTime).Seconds()
+		glog.Info("Request ", reqId, " cost ", elapsedSeconds, " secs")
+	}()
+
 	if r, ok := req.(*pb.RetrieveRequest); ok {
 		bizdef = fmt.Sprintf("%s_%s", r.BizDef, r.RetrieveType.String())
 		reqId = r.RequestId
@@ -50,6 +59,12 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 	ctx = context.WithValue(ctx, ctxBizDefKey, bizdef)
 	ctx = context.WithValue(ctx, ctxReqIdKey, reqId)
 
+	// Debug string builder
+	sb := &txt.StringBuilder{}
+	sb.Append("[Method: Retrieve]")
+	sb.Append(fmt.Sprintf(" [ReqId: %s]", reqId))
+	ctx = context.WithValue(ctx, ctxDebugStrKey, sb)
+
 	res, err := handler(ctx, req)
 	if err != nil {
 		return res, err
@@ -57,6 +72,7 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 
 	if r, ok := res.(*pb.RetrieveResponse); ok {
 		r.RequestId = reqId
+		r.DebugString = sb.ToString()
 	}
 	return res, nil
 }
