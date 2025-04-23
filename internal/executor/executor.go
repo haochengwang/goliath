@@ -860,7 +860,7 @@ func (e *Executor) doCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest)
 		}
 		parsed = cacheLookup("crawl_rt:", "RCache")
 		if parsed != nil {
-			perfExtra3 = "realtime_cache_hit"
+			perfExtra2 = "realtime_cache_hit"
 			return &CrawlAndParseResult{
 				Res:	e.convertParseResult(ctx, parsed),
 			}, nil
