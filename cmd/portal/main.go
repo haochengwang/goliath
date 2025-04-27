@@ -35,7 +35,11 @@ func (s *server) Search(ctx context.Context, req *pb.SearchRequest) (*pb.SearchR
 func main() {
 	flag.Parse()
 
-	glog.Info("Initializing Goliath Portal...")
+	if *exec.IsDev {
+		glog.Info("Initializing Goliath Portal in dev...")
+	} else {
+		glog.Info("Initializing Goliath Portal...")
+	}
 	glog.Info("  ________       .__  .__        __  .__     ")
  	glog.Info(" /  _____/  ____ |  | |__|____ _/  |_|  |__  ")
 	glog.Info("/   \\  ___ /  _ \\|  | |  \\__  \\   __\\  |  \\ ")
