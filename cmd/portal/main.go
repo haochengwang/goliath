@@ -60,4 +60,6 @@ func main() {
 	glog.Flush()
 
 	glog.Error(s.Serve(lis))
+
+	sv.executor.Destroy()
 }

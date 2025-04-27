@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/golang/glog"
-	txt "github.com/linkdotnet/golang-stringbuilder"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -60,9 +59,9 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 	ctx = context.WithValue(ctx, ctxReqIdKey, reqId)
 
 	// Debug string builder
-	sb := &txt.StringBuilder{}
-	sb.Append("[Method: Retrieve]")
-	sb.Append(fmt.Sprintf(" [ReqId: %s]", reqId))
+	sb := &utils.StringBuilder{}
+	sb.WriteString("[Method: Retrieve]")
+	sb.WriteString(fmt.Sprintf(" [ReqId: %s]", reqId))
 	ctx = context.WithValue(ctx, ctxDebugStrKey, sb)
 
 	res, err := handler(ctx, req)
@@ -72,7 +71,7 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 
 	if r, ok := res.(*pb.RetrieveResponse); ok {
 		r.RequestId = reqId
-		r.DebugString = sb.ToString()
+		r.DebugString = sb.String()
 	}
 	return res, nil
 }

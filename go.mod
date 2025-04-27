@@ -6,7 +6,6 @@ require (
 	github.com/IBM/sarama v1.45.1
 	github.com/go-faster/city v1.0.1
 	github.com/golang/glog v1.2.4
-	github.com/linkdotnet/golang-stringbuilder v0.11.0
 	github.com/nacos-group/nacos-sdk-go/v2 v2.2.9
 	github.com/prometheus/client_golang v1.21.1
 	github.com/redis/go-redis/v9 v9.7.3

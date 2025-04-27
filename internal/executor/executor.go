@@ -2,8 +2,9 @@ package executor
 
 import (
 	"context"
+	"flag"
 	"fmt"
-	//"math/rand"
+	"math/rand"
 	"runtime/debug"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,6 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/go-faster/city"
-	txt "github.com/linkdotnet/golang-stringbuilder"
 	"github.com/nacos-group/nacos-sdk-go/v2/clients"
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
@@ -23,13 +23,17 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
-	//"example.com/goliath/internal/utils"
+	"example.com/goliath/internal/utils"
 	pb "example.com/goliath/proto/goliath/v1"
 	cpb "example.com/goliath/proto/crawler/v1"
 	ppb "example.com/goliath/proto/parser/v1"
 )
 
 var (
+	// Flags
+	IsDev = flag.Bool("dev", false, "Is in dev env")
+
+	// Prometheus metrics
 	timer = promauto.NewHistogramVec(prom.HistogramOpts{
 		Name:	"GoliathTimer",
 		Help:	"Goliath Timer",
@@ -45,6 +49,7 @@ var (
 		Help:	"Goliath Gauge",
 	}, []string{"tag", "extra1", "extra2", "extra3", "extra4"})
 
+	// Ret codes
 	SUCCESS			int32 = 0
 	ERR_INVALID_ARGUMENT	int32 = 1
 	ERR_CRAWL_FAILED	int32 = 101
@@ -65,9 +70,14 @@ type Executor struct {
 	nacosClient	config_client.IConfigClient
 	kafkaProducer	sarama.SyncProducer
 
-	workerChan		chan func()
-	workerWaterlevel	atomic.Int32
+	workerChan		chan *WorkerTask
+	workerWaterlevel	map[string]*atomic.Int32
 	waiterGroup		sync.WaitGroup
+}
+
+type WorkerTask struct {
+	Category	string
+	Func		func()
 }
 
 type CacheReaderTask struct {
@@ -173,7 +183,7 @@ func NewExecutor() *Executor {
 		glog.Fatal(err)
 	}
 
-	workerChan := make(chan func())
+	workerChan := make(chan *WorkerTask)
 	e := &Executor{
 		crawlerAddrs:	map[string]string {
 			"BJ": 	"10.3.0.90:9023",
@@ -190,19 +200,35 @@ func NewExecutor() *Executor {
 		nacosClient:		nacosClient,
 		kafkaProducer:		kafkaProducer,
 		workerChan:		workerChan,
+		workerWaterlevel:	map[string]*atomic.Int32 {
+			"crawl_and_parse":	&atomic.Int32{},
+			"read_cache":		&atomic.Int32{},
+			"write_cache":		&atomic.Int32{},
+			"retrieve_cycle":	&atomic.Int32{},
+			"redirect":		&atomic.Int32{},
+			"finalize":		&atomic.Int32{},
+		},
 	}
 
 	workerChanNum := 8 * 1024
 	e.waiterGroup.Add(8 * 1024)
 	for range(workerChanNum) {
 		go func() {
-			for f := range workerChan {
-				e.workerWaterlevel.Add(1)
-				gauge.WithLabelValues("workers", "", "", "", "").Set(float64(e.workerWaterlevel.Load()))
+	defer func() {
+		if r := recover(); r != nil {
+			glog.Error("Panic: ", r, "\n", string(debug.Stack()))
+			glog.Flush()
+		}
+	}()
+			for task := range workerChan {
+				v, _ := e.workerWaterlevel[task.Category]
+				v.Add(1)
+				gauge.WithLabelValues("workers", task.Category, "", "", "").Set(float64(v.Load()))
 
-				f()
-				e.workerWaterlevel.Add(-1)
-				gauge.WithLabelValues("workers", "", "", "", "").Set(float64(e.workerWaterlevel.Load()))
+				task.Func()
+
+				v.Add(-1)
+				gauge.WithLabelValues("workers", task.Category, "", "", "").Set(float64(v.Load()))
 			}
 			e.waiterGroup.Done()
 		}()
@@ -216,10 +242,17 @@ func (e *Executor) Destroy() {
 	e.waiterGroup.Wait()
 }
 
-func (e *Executor) readCache(task *CacheReaderTask) {
-	e.workerChan <- func() {
-		e.doReadCache(task)
+func (e *Executor) asyncWorkerCall(category string, f func()) {
+	e.workerChan <- &WorkerTask{
+		Category:	category,
+		Func:		f,
 	}
+}
+
+func (e *Executor) readCache(task *CacheReaderTask) {
+	e.asyncWorkerCall("read_cache", func() {
+		e.doReadCache(task)
+	})
 }
 
 func (e *Executor) doReadCache(task *CacheReaderTask) {
@@ -228,9 +261,9 @@ func (e *Executor) doReadCache(task *CacheReaderTask) {
 }
 
 func (e *Executor) writeToCache(task *CacheWriterTask) {
-	e.workerChan <- func() {
+	e.asyncWorkerCall("write_cache", func() {
 		e.doWriteToCache(task)
-	}
+	})
 }
 
 func (e *Executor) doWriteToCache(t *CacheWriterTask) {
@@ -243,9 +276,9 @@ func (e *Executor) doWriteToCache(t *CacheWriterTask) {
 }
 
 func (e *Executor) kafkaProduce(r *cpb.CrawlResponse) {
-	e.workerChan <- func() {
+	e.asyncWorkerCall("kafka_produce", func() {
 		e.doKafkaProduce(r)
-	}
+	})
 }
 
 func (e *Executor) doKafkaProduce(r *cpb.CrawlResponse) {
@@ -271,11 +304,14 @@ func (e *Executor) convertCacheEntity(ctx context.Context, p *pb.CacheEntity) *p
 		return nil
 	}
 
-	return &pb.RetrieveResponse {
-		Result: &pb.RetrieveResult {
-			Url:	p.Url,
-		},
+	for _, parse := range p.CachedParses {
+		if parse.Success {
+			return &pb.RetrieveResponse {
+				Result: parse.Result,
+			}
+		}
 	}
+	return nil
 }
 
 func convertParseResult(ctx context.Context, p *ppb.ParseContentResponse) *pb.RetrieveResponse {
@@ -315,11 +351,11 @@ func contextObserver(ctx context.Context, tag string, extra1 string, extra2 stri
 }
 
 func contextLog(ctx context.Context, s string) {
-	ctx.Value(ctxDebugStrKey).(*txt.StringBuilder).Append(s)
+	ctx.Value(ctxDebugStrKey).(*utils.StringBuilder).WriteString(s)
 }
 
 func contextLogStr(ctx context.Context) string {
-	return ctx.Value(ctxDebugStrKey).(*txt.StringBuilder).ToString()
+	return ctx.Value(ctxDebugStrKey).(*utils.StringBuilder).String()
 }
 
 func (e *Executor) invokeDevRetrieve(ctx context.Context, req *pb.RetrieveRequest) {
@@ -331,7 +367,7 @@ func (e *Executor) invokeDevRetrieve(ctx context.Context, req *pb.RetrieveReques
 	defer conn.Close()
 
 	c := pb.NewGoliathPortalClient(conn)
-	innerCtx, cancel := context.WithTimeout(ctx, time.Duration(req.TimeoutMs) * time.Millisecond)
+	innerCtx, cancel := context.WithTimeout(context.Background(), time.Duration(int32(req.TimeoutMs) + 100) * time.Millisecond)
 	defer cancel()
 
 	_, err = c.Retrieve(innerCtx, req)
@@ -582,29 +618,28 @@ type RetrieveStatusHolder struct {
 	globalCacheResult	atomic.Pointer[ppb.ParseContentResponse]
 	realtimeCacheResult	atomic.Pointer[ppb.ParseContentResponse]
 	asyncCacheResult	atomic.Pointer[pb.CacheEntity]
+	crawlAndParseResult	atomic.Pointer[CrawlAndParseResult]
 }
 
 // Whether need to redo crawl & parse based on the content of the cache
 // If not, return the response
 // TODO(wanghaocheng) optimize me
-func (e *Executor) needRedoCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest, c *pb.CacheEntity) (bool, *pb.RetrieveResponse) {
+func (e *Executor) needRedoCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest, c *pb.CacheEntity) bool {
 	if c == nil {  // Need redo
-		return true, nil
+		return true
 	}
 
 	for _, p := range c.CachedParses {
 		ms := p.ParseTimestampMs
 		parseTimestamp := time.Unix(ms / 1000, ms % 1000 * 1000)
 		if time.Since(parseTimestamp).Seconds() > 86400 {
-			return true, nil
+			return true
 		} else {
-			return false, &pb.RetrieveResponse {
-				Result:	p.Result,
-			}
+			return false
 		}
 	}
 
-	return true, nil
+	return true
 }
 
 // Perform actual cache refresh
@@ -669,7 +704,6 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 	defer func() {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "async_retrieve", perfExtra1, perfExtra2, perfExtra3).Observe(elapsedSeconds)
-		glog.Info(contextLogStr(ctx))
 	}()
 
 	if req.TimeoutMs < 100 {
@@ -691,16 +725,70 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 	}
 
 	var h RetrieveStatusHolder
+	globalCacheDoneChan := make(chan int)
+	realtimeCacheDoneChan := make(chan int)
+	asyncCacheDoneChan := make(chan int)
+	finalizeChan := make(chan int)
+	doneChan := make(chan int, 1)
 
-	asyncCacheChan := make(chan *pb.CacheEntity)
+	e.asyncWorkerCall("retrieve_cycle", func() {
+		defer close(globalCacheDoneChan)
+		defer close(realtimeCacheDoneChan)
+		defer close(asyncCacheDoneChan)
+		defer close(finalizeChan)
+		defer close(doneChan)
+
+		barrier := 3
+		for barrier > 0 {
+			select {
+			case <-globalCacheDoneChan:
+				barrier --
+			case <-realtimeCacheDoneChan:
+				barrier --
+			case <-asyncCacheDoneChan:
+				// Evaluate cache entity
+				ret := h.asyncCacheResult.Load()
+				redo := e.needRedoCrawlAndParse(ctx, req, ret);
+				if redo {
+					req.BypassCache = true
+					req.TimeoutMs = 60 * 1000
+					e.crawlAndParse(&CrawlAndParseTask{
+					Ctx:	context.WithoutCancel(ctx),
+						Req:	req,
+						Callback:	func(res *CrawlAndParseResult, err error) {
+							defer func() { finalizeChan <- 1 }()
+							if res != nil && res.CrawlContext != nil && res.ParseContext != nil {
+								h.crawlAndParseResult.Store(res)
+							}
+						},
+					})
+				} else {
+					e.asyncWorkerCall("finalize", func() { finalizeChan <- 1 })
+				}
+			case <-finalizeChan:
+				barrier --
+			}
+		}
+
+		doneChan <- 1
+		ret := h.crawlAndParseResult.Load()
+		if ret != nil && !*IsDev {
+			e.doCacheRefresh(ctx, req, h.asyncCacheResult.Load(), ret)
+		}
+		glog.Info(contextLogStr(ctx))
+
+		// TODO: send to kafka
+	})
+
 	if !req.BypassCache {
 		// Process global cache
 		e.readCache(&CacheReaderTask{
 			Key:		fmt.Sprintf("crawl:%d", city.Hash64([]byte(req.Url))),
 			Callback:	func(ret string, err error) {
+				defer func() { globalCacheDoneChan <- 1 }()
 				elapsedSeconds := time.Since(startTime).Seconds()
 				if err != nil || ret == "none" {
-					contextLog(ctx, fmt.Sprintf(" [GCache miss %f]", elapsedSeconds))
+					contextLog(ctx, fmt.Sprintf(" [GCache miss]"))
 					return
 				}
 				contextLog(ctx, fmt.Sprintf(" [GCache hit %f]", elapsedSeconds))
@@ -709,9 +797,9 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				err = proto.Unmarshal([]byte(ret), parseResult)
 				if err != nil {
 					glog.Error("Failed to unmarshal proto from global cache, Url = ", req.Url)
-					return
+				} else {
+					h.globalCacheResult.Store(parseResult)
 				}
-				h.globalCacheResult.Store(parseResult)
 			},
 		})
 
@@ -719,6 +807,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		e.readCache(&CacheReaderTask{
 			Key:		fmt.Sprintf("crawl_rt:%d", city.Hash64([]byte(req.Url))),
 			Callback:	func(ret string, err error) {
+				defer func() { realtimeCacheDoneChan <- 1 }()
 				elapsedSeconds := time.Since(startTime).Seconds()
 				if err != nil || ret == "none" {
 					contextLog(ctx, fmt.Sprintf(" [RCache miss %f]", elapsedSeconds))
@@ -730,22 +819,20 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				err = proto.Unmarshal([]byte(ret), parseResult)
 				if err != nil {
 					glog.Error("Failed to unmarshal proto from realtime cache, Url = ", req.Url)
-					return
+				} else {
+					h.realtimeCacheResult.Store(parseResult)
 				}
-				h.realtimeCacheResult.Store(parseResult)
 			},
 		})
 
-		glog.Info("Read from cache: ", fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(req.Url))))
 		// Process async cache
 		e.readCache(&CacheReaderTask{
 			Key:		fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(req.Url))),
 			Callback:	func(ret string, err error) {
+				defer func() { asyncCacheDoneChan <- 1 }()
 				elapsedSeconds := time.Since(startTime).Seconds()
-				defer close(asyncCacheChan)
 				if err != nil {  // Cache miss
 					contextLog(ctx, fmt.Sprintf( "[ACache miss %f]", elapsedSeconds))
-					asyncCacheChan <- nil
 					return
 				}
 				contextLog(ctx, fmt.Sprintf( "[ACache hit %f]", elapsedSeconds))
@@ -754,106 +841,68 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				err = proto.Unmarshal([]byte(ret), cacheEntity)
 				if err != nil {
 					glog.Error("Failed to unmarshal protobuf for async cache, Url = ", req.Url)
-					asyncCacheChan <- nil
-					return
+				} else {
+					h.asyncCacheResult.Store(cacheEntity)
 				}
-				h.asyncCacheResult.Store(cacheEntity)
-				asyncCacheChan <- cacheEntity
 			},
 		})
 	} else {
-		go func() {
-			asyncCacheChan <- nil
-			close(asyncCacheChan)
-		}()
+		globalCacheDoneChan <- 1
+		realtimeCacheDoneChan <- 1
+		asyncCacheDoneChan <- 1
 	}
 
-	var crawlParseChan chan *CrawlAndParseResult
-	crawlParseChan = nil
-
-	timeoutMs := req.TimeoutMs - int32(time.Since(startTime).Milliseconds()) - 10
+	timeoutMs := req.TimeoutMs - 10
 	timer := time.NewTicker(time.Duration(timeoutMs) * time.Millisecond)
 	defer timer.Stop()
 
 	fallback := func() *pb.RetrieveResponse {
-			if p := h.asyncCacheResult.Load(); p != nil {
+			if p := h.crawlAndParseResult.Load(); p != nil {
+				perfExtra2 = "crawl_and_parse"
+				contextLog(ctx, " [Ret CrawlAndParse]")
+				return &pb.RetrieveResponse{
+					Result:	p.ParseContext.Result,
+				}
+			}
+
+			if p := e.convertCacheEntity(ctx, h.asyncCacheResult.Load()); p != nil {
 				perfExtra2 = "async_cache"
 				contextLog(ctx, " [Ret ACache]")
-				return e.convertCacheEntity(ctx, p)
-			} else if p := h.realtimeCacheResult.Load(); p != nil {
+				return p
+			}
+
+			if p := h.realtimeCacheResult.Load(); p != nil {
 				perfExtra2 = "realtime_cache"
 				contextLog(ctx, " [Ret RCache]")
 				return convertParseResult(ctx, p)
-			} else if p := h.globalCacheResult.Load(); p != nil {
+			}
+
+			if p := h.globalCacheResult.Load(); p != nil {
 				perfExtra2 = "global_cache"
 				contextLog(ctx, " [Ret GCache]")
 				return convertParseResult(ctx, p)
-			} else {
-				perfExtra1 = "error"
-				contextLog(ctx, " [Ret Failed]")
-				return &pb.RetrieveResponse{
-					RetCode:	ERR_INTERNAL_ERROR,
-				}
+			}
+
+			perfExtra1 = "error"
+			contextLog(ctx, " [Ret Failed]")
+			return &pb.RetrieveResponse{
+				RetCode:	ERR_INTERNAL_ERROR,
 			}
 	}
 
-	for {
-		select {
-		case ret, ok := <-asyncCacheChan:
-			if !ok {
-				asyncCacheChan = nil
-				continue
-			}
-
-			// Evaluate cache entity
-			redo, res := e.needRedoCrawlAndParse(ctx, req, ret);
-			if redo {
-				req.BypassCache = true
-				req.TimeoutMs = 60 * 1000
-				crawlParseChan = make(chan *CrawlAndParseResult)
-				e.crawlAndParse(&CrawlAndParseTask{
-					Ctx:	context.WithoutCancel(ctx),
-					Req:	req,
-					Callback:	func(res *CrawlAndParseResult, err error) {
-						defer close(crawlParseChan)
-						if err != nil || res == nil || res.CrawlContext == nil || res.ParseContext == nil {
-							crawlParseChan <- nil
-						} else {
-							crawlParseChan <- res
-						}
-					},
-				})
-			} else {
-				perfExtra2 = "async_cache"
-				contextLog(ctx, " [Ret ACache]")
-				return res
-			}
-		case ret, ok := <-crawlParseChan:
-			if !ok {
-				crawlParseChan = nil
-				continue
-			}
-
-			if ret == nil {
-				return fallback()
-			}
-			e.doCacheRefresh(ctx, req, h.asyncCacheResult.Load(), ret)
-
-			perfExtra2 = "crawl_and_parse"
-			contextLog(ctx, " [Ret CrawlAndParse]")
-			return ret.Res
-		case <-timer.C:
-			// Fallback to cache
-			return fallback()
-		}
+	select {
+	case <-doneChan:
+	case <-timer.C:
 	}
+
+	return fallback()
 }
 
 func (e *Executor) crawlAndParse(r *CrawlAndParseTask) {
-	e.workerChan <- func() {
+	e.asyncWorkerCall("crawl_and_parse", func() {
 		res, err := e.doCrawlAndParse(r.Ctx, r.Req)
 		r.Callback(res, err)
-	}
+	})
 }
 
 func (e *Executor) syncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
@@ -871,10 +920,16 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 	contextLog(ctx, fmt.Sprintf(" [BizDef %s]", req.BizDef))
 	contextLog(ctx, fmt.Sprintf(" [URL %s]", req.Url))
 
-	//async := rand.Intn(100) < 20
-	//if async {
-	//	go e.invokeDevRetrieve(ctx, req)
-	//}
+	// TODO(wanghaocheng): 
+	// Sample 10% traffic to dev pods for debugging purposes
+	// Need to be replaced by more canonical approach
+	if !*IsDev {
+		sample := rand.Intn(100) < 10
+
+		if sample {
+			e.asyncWorkerCall("redirect", func() { e.invokeDevRetrieve(ctx, req) })
+		} 
+	}
 	return e.asyncRetrieve(ctx, req)
 }
 
@@ -884,7 +939,6 @@ func (e *Executor) doCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest)
 	defer func() {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "retrieve", perfExtra1, perfExtra2, perfExtra3).Observe(elapsedSeconds)
-		glog.Info(contextLogStr(ctx))
 	}()
 
 	if !req.BypassCache {
