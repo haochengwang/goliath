@@ -539,6 +539,7 @@ func (e *Executor) needRedoCrawlAndParse(ctx context.Context, req *pb.RetrieveRe
 	for _, p := range c.CachedParses {
 		ms := p.ParseTimestampMs
 		parseTimestamp := time.Unix(ms / 1000, ms % 1000 * 1000)
+		// TODO(wanghaocheng) optimize me
 		if time.Since(parseTimestamp).Seconds() > 86400 {
 			return true
 		} else {
@@ -677,7 +678,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 						BypassCache:	true,
 						Callback:	func(res *CrawlAndParseResult, err error) {
 							defer func() { crawlAndParseChan <- 1 }()
-							if res != nil && res.CrawlContext != nil && res.ParseContext != nil {
+							if res != nil {
 								h.crawlAndParseResult.Store(res)
 							}
 						},
