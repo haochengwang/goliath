@@ -2,7 +2,9 @@ package executor
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"math/rand"
 	"time"
 
 	"github.com/golang/glog"
@@ -14,6 +16,10 @@ import (
 )
 
 var (
+	// Flags
+	GreyRedirectRatio = flag.Int("grey_redirect_ratio", 0, "Traffic ration to rediret to grey env")
+
+	// Context keys
 	ctxReqIdKey = "reqid"
 	ctxDomainKey = "domain"
 	ctxBizDefKey = "bizdef"
@@ -26,7 +32,43 @@ func generateReqId() string {
 		now.Hour(), now.Minute(), now.Second(), now.UnixNano() % 1000000)
 }
 
+func RedirectToGrey(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	// TODO(wanghaocheng) Warning this sucks!
+	// Redirect part of traffic to goliath-portal-grey service
+	// Need to be repleaced with more canonical approach
+	conn, err := createGrpcConn("10.3.32.107:9023")
+
+	if err != nil {
+		return conn, err
+	}
+	defer conn.Close()
+
+	if r, ok := req.(*pb.RetrieveRequest); ok {
+		client := pb.NewGoliathPortalClient(conn)
+		fres, ferr := client.Retrieve(ctx, r)
+		if ferr != nil {
+			glog.Error("Failed redirecting retrieve request: ", ferr)
+		}
+		return fres, ferr
+	} else if r, ok := req.(*pb.SearchRequest); ok {
+		client := pb.NewGoliathPortalClient(conn)
+		fres, ferr := client.Search(ctx, r)
+		if ferr != nil {
+			glog.Error("Failed redirecting search requests: ", ferr)
+		}
+		return fres, ferr
+	} else {
+		glog.Error("Failed redirecting request, unknown method")
+		return nil, fmt.Errorf("Unknown method")
+	}
+}
+
 func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	redirectToGrey := rand.Intn(100) < *GreyRedirectRatio
+	if redirectToGrey {
+		return RedirectToGrey(ctx, req, info, handler)
+	}
+
 	bizdef := ""
 	reqId := ""
 	startTime := time.Now()

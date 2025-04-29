@@ -194,8 +194,9 @@ func NewExecutor() *Executor {
 	workerChan := make(chan *WorkerTask)
 	e := &Executor{
 		crawlerAddrs:	map[string]string {
-			"BJ": 	"10.3.0.90:9023",
-			"TOK":	"10.203.0.59:9023",
+			"BJ": 		"10.3.0.90:9023",
+			"BJNEW":	"10.3.32.116:9023",
+			"TOK":		"10.203.0.59:9023",
 		},
 		searchAddrs:	map[string]string {
 			"BJ":	"10.3.0.149:9023",
@@ -215,6 +216,7 @@ func NewExecutor() *Executor {
 			"retrieve_cycle":	&atomic.Int32{},
 			"redirect":		&atomic.Int32{},
 			"kafka_produce":	&atomic.Int32{},
+			"upload_to_cos":	&atomic.Int32{},
 			"finalize":		&atomic.Int32{},
 		},
 	}
@@ -297,9 +299,7 @@ func (e *Executor) doKafkaProduce(t *KafkaProduceTask) {
 	})
 
 	if err != nil {
-		glog.Error("Kafka produce message error: ", err)
-	} else {
-		glog.Info("Kafka produced message: partition = ", partition, ", offset = ", offset)
+		glog.Error("Kafka produce message error, partition = ", partition, ", offset = ", offset, ", err = ", err)
 	}
 }
 
@@ -537,9 +537,15 @@ func (e *Executor) needRedoCrawlAndParse(ctx context.Context, req *pb.RetrieveRe
 	}
 
 	for _, p := range c.CachedParses {
+		if !p.Success || p.Result == nil || len(p.Result.Content) == 0 {
+			continue
+		}
 		ms := p.ParseTimestampMs
 		parseTimestamp := time.Unix(ms / 1000, ms % 1000 * 1000)
 		// TODO(wanghaocheng) optimize me
+		if req.RetrieveType == pb.RetrieveType_PDF {
+			return false
+		}
 		if time.Since(parseTimestamp).Seconds() > 86400 {
 			return true
 		} else {
@@ -550,6 +556,31 @@ func (e *Executor) needRedoCrawlAndParse(ctx context.Context, req *pb.RetrieveRe
 	return true
 }
 
+func (e *Executor) copyCrawlContextAndUploadToCos(ctx context.Context, req *pb.RetrieveRequest, c *pb.CrawlContext) *pb.CrawlContext {
+	now := time.Now()
+	cosnPath := ""
+	if c.Content != nil && c.Success && len(c.Content) > 0 {
+		content := c.Content
+		cosnPath = fmt.Sprintf("crawl/%d-%d-%d/url-%d", now.Year(), now.Month(), now.Day(), city.Hash64([]byte(req.Url)))
+		e.asyncWorkerCall("upload_to_cos", func() {
+			uploadToCos(cosnPath, content)
+		})
+	}
+	return &pb.CrawlContext {
+		CrawlerKey:		c.CrawlerKey,
+		CrawlTimestampMs:	c.CrawlTimestampMs,
+		Success:		c.Success,
+		ErrorMessage:		c.ErrorMessage,
+		HttpCode:		c.HttpCode,
+		ContentType:		c.ContentType,
+		ContentEncoding:	c.ContentEncoding,
+		// emit content
+		CrawlTimecostMs:	c.CrawlTimecostMs,
+		ContentLen:		c.ContentLen,
+		ContentCosnPath:	cosnPath,
+	}
+}
+
 // Perform actual cache refresh
 // TODO(wanghaocheng) optimize me
 func (e *Executor) doCacheRefresh(ctx context.Context, req *pb.RetrieveRequest, ce *pb.CacheEntity, r *CrawlAndParseResult) {
@@ -557,47 +588,51 @@ func (e *Executor) doCacheRefresh(ctx context.Context, req *pb.RetrieveRequest, 
 	if ce == nil {
 		entity = &pb.CacheEntity{
 			Url:		req.Url,
-			CachedCrawls:	[]*pb.CrawlContext {
-				r.CrawlContext,
-			},
-			CachedParses:	[]*pb.ParseContext {
-				r.ParseContext,
-			},
+		}
+
+		if r.CrawlContext != nil {
+			entity.CachedCrawls = []*pb.CrawlContext { e.copyCrawlContextAndUploadToCos(ctx, req, r.CrawlContext) }
+		}
+		if r.ParseContext != nil {
+			entity.CachedParses = []*pb.ParseContext { r.ParseContext }
 		}
 	} else {
 		entity = ce
 
-		crawlReplaced := false
-		for i, crawl := range entity.CachedCrawls {
-			if crawl == nil || crawl.CrawlerKey == r.CrawlContext.CrawlerKey {
-				entity.CachedCrawls[i] = r.CrawlContext
-				crawlReplaced = true
-				break
+		if r.CrawlContext != nil {
+			crawlReplaced := false
+			for i, crawl := range entity.CachedCrawls {
+				if crawl == nil || crawl.CrawlerKey == r.CrawlContext.CrawlerKey {
+					entity.CachedCrawls[i] = e.copyCrawlContextAndUploadToCos(ctx, req, r.CrawlContext)
+					crawlReplaced = true
+					break
+				}
+			}
+
+			if !crawlReplaced {
+				entity.CachedCrawls = append(entity.CachedCrawls, r.CrawlContext)
 			}
 		}
 
-		if !crawlReplaced {
-			entity.CachedCrawls = append(entity.CachedCrawls, r.CrawlContext)
-		}
-
-		parseReplaced := false
-		for i, parse := range entity.CachedParses {
-			if parse == nil || parse.ParserKey == r.ParseContext.ParserKey {
-				entity.CachedParses[i] = r.ParseContext
-				parseReplaced = true
-				break
+		if r.ParseContext != nil {
+			parseReplaced := false
+			for i, parse := range entity.CachedParses {
+				if parse == nil || parse.ParserKey == r.ParseContext.ParserKey {
+					entity.CachedParses[i] = r.ParseContext
+					parseReplaced = true
+					break
+				}
 			}
-		}
 
-		if !parseReplaced {
-			entity.CachedParses = append(entity.CachedParses, r.ParseContext)
+			if !parseReplaced {
+				entity.CachedParses = append(entity.CachedParses, r.ParseContext)
+			}
 		}
 	}
 	serializedEntity, err := proto.Marshal(entity)
 	if err != nil {
 		glog.Error("Failed to marshal CacheEntity proto, err = ", err)
 	} else {
-		glog.Info("Write to cache: ", fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(req.Url))))
 		e.writeToCache(&CacheWriterTask{
 			Key:			fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(req.Url))),
 			Value:			serializedEntity,
@@ -854,7 +889,8 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 	defer timer.Stop()
 
 	fallback := func() *pb.RetrieveResponse {
-			if p := h.crawlAndParseResult.Load(); p != nil {
+			if p := h.crawlAndParseResult.Load();
+				p != nil && p.ParseContext != nil && p.ParseContext.Success {
 				perfExtra2 = "crawl_and_parse"
 				resultSource = "CrawlAndParse"
 				return &pb.RetrieveResponse{
@@ -992,6 +1028,8 @@ func (e *Executor) doCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest,
 	region := "BJ"
 	if req.ForeignHint {
 		region = "TOK"
+	} else if rand.Intn(100) < 60 {
+		region = "BJNEW"
 	}
 	crawlContext, err := e.invokeCrawl(ctx, req, region, timeoutMs)
 	if err != nil {
