@@ -309,16 +309,27 @@ func (e *Executor) doKafkaProduce(t *KafkaProduceTask) {
 	}
 }
 
-func (e *Executor) convertCacheEntity(ctx context.Context, p *pb.CacheEntity) *pb.RetrieveResponse {
+func (e *Executor) convertCacheEntity(ctx context.Context, req *pb.RetrieveRequest, p *pb.CacheEntity) *pb.RetrieveResponse {
 	if p == nil {
 		return nil
 	}
 
 	for _, parse := range p.CachedParses {
 		if parse.Success {
-			return &pb.RetrieveResponse {
+			r := &pb.RetrieveResponse {
 				Result: parse.Result,
 			}
+
+			// For history crawl entities
+			if r.Result.SourceContentType == pb.ContentType_TYPE_UNKNOWN {
+				if req.RetrieveType == pb.RetrieveType_PDF {
+					r.Result.SourceContentType = pb.ContentType_TYPE_PDF
+				} else {
+					r.Result.SourceContentType = pb.ContentType_TYPE_WEB_PAGE
+				}
+			}
+
+			return r
 		}
 	}
 	return nil
@@ -329,7 +340,7 @@ func convertParseResult(ctx context.Context, p *ppb.ParseContentResponse) *pb.Re
 		return nil
 	}
 
-	return &pb.RetrieveResponse {
+	r := &pb.RetrieveResponse {
 		Result:	&pb.RetrieveResult {
 			Url:		p.Url,
 			Title:		p.Title,
@@ -340,6 +351,8 @@ func convertParseResult(ctx context.Context, p *ppb.ParseContentResponse) *pb.Re
 			PositionList:	p.PositionList,
 		},
 	}
+
+	return r
 }
 
 func contextCounter(ctx context.Context, tag string, extra1 string, extra2 string, extra3 string) prom.Counter {
@@ -664,6 +677,31 @@ func (e *Executor) doCacheRefresh(ctx context.Context, req *pb.RetrieveRequest, 
 	}
 }
 
+func (e *Executor) doCacheTidy(ctx context.Context, req *pb.RetrieveRequest, ce *pb.CacheEntity) {
+	modified := false
+	for i, crawl := range ce.CachedCrawls {
+		if crawl.Content != nil && len(crawl.Content) > 0 {
+			ce.CachedCrawls[i] = e.copyCrawlContextAndUploadToCos(ctx, req, crawl)
+			modified = true
+		}
+	}
+
+	if !modified {
+		return
+	}
+
+	serializedEntity, err := proto.Marshal(ce)
+	if err != nil {
+		glog.Error("Failed to marshal CacheEntity proto, err = ", err)
+	} else {
+		e.writeToCache(&CacheWriterTask{
+			Key:			fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(req.Url))),
+			Value:			serializedEntity,
+			ExpirationSeconds:	0,
+		})
+	}
+}
+
 func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
 	startTime := time.Now()
 	resultSource := "Failed"
@@ -736,7 +774,10 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 						},
 					})
 				} else {
-					e.asyncWorkerCall("finalize", func() { close(crawlAndParseChan) })
+					e.asyncWorkerCall("finalize", func() {
+						e.doCacheTidy(ctx, req, ret)
+						close(crawlAndParseChan)
+					})
 				}
 			case <-crawlAndParseChan:
 				crawlAndParseChan = nil
@@ -927,7 +968,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				}
 			}
 
-			if p := e.convertCacheEntity(ctx, h.asyncCacheResult.Load()); p != nil {
+			if p := e.convertCacheEntity(ctx, req, h.asyncCacheResult.Load()); p != nil {
 				perfExtra2 = "async_cache"
 				resultSource = "ACache"
 				return p
@@ -1180,8 +1221,20 @@ func (e *Executor) doCrawlAndParse(t *CrawlAndParseTask) (*CrawlAndParseResult, 
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextLog(ctx, fmt.Sprintf(" [CrawlAndParseSuccess %f]", elapsedSeconds))
 	perfExtra2 = "crawl_and_parse"
+
+	r := &pb.RetrieveResponse {
+		Result: parseContext.Result,
+	}
+	ct := pb.ContentType_TYPE_UNKNOWN
+	if isPDF(req, crawlContext.ContentType) {
+		ct = pb.ContentType_TYPE_PDF
+	} else {
+		ct = pb.ContentType_TYPE_WEB_PAGE
+	}
+	r.Result.SourceContentType = ct
+
 	return &CrawlAndParseResult{
-		Res:		convertParseResult(ctx, parsed),
+		Res:		r,
 		CrawlContext:	crawlContext,
 		ParseContext:	parseContext,
 	}, nil

@@ -23,7 +23,10 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 	timeoutMs := int32(60 * 1000)
 	maxContentLen := int32(30 * 1024 * 1024)
 	if req.ForeignHint {
-		if rand.Intn(100) < 40 {
+		// TODO(wanghaocheng): Avoid heavy traiffc via Tokyo
+		if strings.HasSuffix(req.Url, "pdf") {
+			region = "SV-ALI"
+		} else if rand.Intn(100) < 40 {
 			region = "SV-ALI"
 		} else {
 			region = "TOK"
@@ -151,8 +154,6 @@ func (e *Executor) invokeNginxCrawl(ctx context.Context, req *pb.RetrieveRequest
 
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextObserver(ctx, "crawl", "success", crawlerKey, "").Observe(elapsedSeconds)
-	glog.Info("Body len = ", len(body))
-	glog.Info("Body = ", string(body))
 	return &pb.CrawlContext {
 		CrawlerKey:		crawlerKey,
 		CrawlTimestampMs:	startTime.UnixMilli(),
@@ -344,6 +345,9 @@ func (e *Executor) invokeNormalCrawl(ctx context.Context, req *pb.RetrieveReques
 			ErrorMessage:		err.Error(),
 			HttpCode:		r.StatusCode,
 			Content:		r.Content,
+			ContentLen:		0,
+			ContentType:		r.ContentType,
+			ContentEncoding:	r.Encoding,
 		}, err
 	}
 

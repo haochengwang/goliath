@@ -12,6 +12,10 @@ import (
 	pb "example.com/goliath/proto/goliath/v1"
 )
 
+var (
+	url = flag.String("url", "", "URL to retrieve from cache")
+)
+
 func main() {
 	flag.Parse()
 
@@ -23,8 +27,7 @@ func main() {
 	//url := "https://mmedispa.com/2025/04/21/toronto-2025-reveal-simple-effective-acne-removal-secrets/"
 	//url := "https://zhidao.baidu.com/question/1708281467644467820.html"
 	//url := "https://zhuanlan.zhihu.com/p/379009259"
-	url := "https://baijiahao.baidu.com/s?id=1819882672789672130"
-	key := fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(url)))
+	key := fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(*url)))
 	//key = "Goliath|Async|18207729575868377158"
 	ret, err := redisClient.Get(context.Background(), key).Result()
 
