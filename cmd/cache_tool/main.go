@@ -20,9 +20,10 @@ func main() {
 		Password:	"2023@Ystech",
 		DB:		0,
 	})
-	url := "https://mogua.co/static_analyzer/?name=base.apk&checksum=fb11f2ab14c0334e0688454e1eaf5c66&type=apk"
 	//url := "https://mmedispa.com/2025/04/21/toronto-2025-reveal-simple-effective-acne-removal-secrets/"
 	//url := "https://zhidao.baidu.com/question/1708281467644467820.html"
+	//url := "https://zhuanlan.zhihu.com/p/379009259"
+	url := "https://baijiahao.baidu.com/s?id=1819882672789672130"
 	key := fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(url)))
 	//key = "Goliath|Async|18207729575868377158"
 	ret, err := redisClient.Get(context.Background(), key).Result()
@@ -38,6 +39,12 @@ func main() {
 	}
 
 	c := []string{}
+	for _, crawl := range cacheEntity.CachedCrawls {
+		if crawl.Content != nil {
+			//c = append(c, string(crawl.Content))
+			//crawl.Content = []byte{}
+		}
+	}
 	for _, parse := range cacheEntity.CachedParses {
 		if parse.Result != nil {
 			c = append(c, string(parse.Result.Content))

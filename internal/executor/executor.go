@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/rand"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,6 +108,7 @@ type CrawlAndParseResult struct {
 type CrawlAndParseTask struct {
 	Ctx		context.Context
 	Req		*pb.RetrieveRequest
+	CacheEntity	*pb.CacheEntity
 	BypassCache	bool		// If not present, use the timeout in req
 	TimeoutMs	int32		// If not present, use the timeout in req
 	Callback	func(*CrawlAndParseResult, error)
@@ -143,9 +145,9 @@ func initNacosConfigClient() config_client.IConfigClient {
 func createGrpcConn(addr string) (*grpc.ClientConn, error) {
 	return grpc.Dial(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithInitialConnWindowSize(10 * 1024 * 1024),
-		grpc.WithInitialWindowSize(10 * 1024 * 1024),
-		grpc.WithMaxMsgSize(10 * 1024 * 1024))
+		grpc.WithInitialConnWindowSize(100 * 1024 * 1024),
+		grpc.WithInitialWindowSize(100 * 1024 * 1024),
+		grpc.WithMaxMsgSize(100 * 1024 * 1024))
 }
 
 func NewExecutor() *Executor {
@@ -196,7 +198,11 @@ func NewExecutor() *Executor {
 		crawlerAddrs:	map[string]string {
 			"BJ": 		"10.3.0.90:9023",
 			"BJNEW":	"10.3.32.116:9023",
+			"BJ:RENDER":	"http://10.3.8.41:30001/download/",
 			"TOK":		"10.203.0.59:9023",
+			// Via nginx
+			"SV-ALI":	"47.254.88.250:9023",
+			"SV-ALI-NGINX":	"47.254.88.250:13001",
 		},
 		searchAddrs:	map[string]string {
 			"BJ":	"10.3.0.149:9023",
@@ -222,15 +228,15 @@ func NewExecutor() *Executor {
 	}
 
 	workerChanNum := 8 * 1024
-	e.waiterGroup.Add(8 * 1024)
+	e.waiterGroup.Add(workerChanNum)
 	for range(workerChanNum) {
 		go func() {
-	defer func() {
-		if r := recover(); r != nil {
-			glog.Error("Panic: ", r, "\n", string(debug.Stack()))
-			glog.Flush()
-		}
-	}()
+			defer func() {
+				if r := recover(); r != nil {
+					glog.Error("Panic: ", r, "\n", string(debug.Stack()))
+					glog.Flush()
+				}
+			}()
 			for task := range workerChan {
 				v, _ := e.workerWaterlevel[task.Category]
 				v.Add(1)
@@ -380,12 +386,22 @@ func (e *Executor) invokeDevRetrieve(ctx context.Context, req *pb.RetrieveReques
 	}
 }
 
-func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, crawledContent []byte, parseTimeoutMs int32) (*ppb.ParseContentResponse, *pb.ParseContext, error) {
+func isPDF(req *pb.RetrieveRequest, contentType string) bool {
+	if len(contentType) == 0 {
+		return req.RetrieveType == pb.RetrieveType_PDF
+	}
+	return strings.Contains(contentType, "pdf")
+}
+
+func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, crawlContext *pb.CrawlContext, parseTimeoutMs int32) (*ppb.ParseContentResponse, *pb.ParseContext, error) {
 	startTime := time.Now()
 
 	var pm ppb.ParseMethod
 	var parserRegion string
-	if req.RetrieveType == pb.RetrieveType_PDF {
+
+	crawledContent := crawlContext.Content
+
+	if isPDF(req, crawlContext.ContentType) {
 		parserRegion = "BJ-MED"
 		pm = ppb.ParseMethod_PDF
 	} else if req.RetrieveType == pb.RetrieveType_VIDEO_SUMMARY {
@@ -590,31 +606,38 @@ func (e *Executor) doCacheRefresh(ctx context.Context, req *pb.RetrieveRequest, 
 			Url:		req.Url,
 		}
 
-		if r.CrawlContext != nil {
+		if r.CrawlContext != nil && r.CrawlContext.Success {
 			entity.CachedCrawls = []*pb.CrawlContext { e.copyCrawlContextAndUploadToCos(ctx, req, r.CrawlContext) }
 		}
-		if r.ParseContext != nil {
+		if r.ParseContext != nil && r.ParseContext.Success {
 			entity.CachedParses = []*pb.ParseContext { r.ParseContext }
 		}
 	} else {
-		entity = ce
+		entity = &pb.CacheEntity{
+			Url:		req.Url,
+			CachedCrawls:	ce.CachedCrawls,
+			CachedParses:	ce.CachedParses,
+		}
 
-		if r.CrawlContext != nil {
+		if r.CrawlContext != nil && r.CrawlContext.Success {
 			crawlReplaced := false
 			for i, crawl := range entity.CachedCrawls {
 				if crawl == nil || crawl.CrawlerKey == r.CrawlContext.CrawlerKey {
-					entity.CachedCrawls[i] = e.copyCrawlContextAndUploadToCos(ctx, req, r.CrawlContext)
+					// Compare crawl timestamp to ensure the crawl is based on the cached one
+					if crawl.CrawlTimestampMs != r.CrawlContext.CrawlTimestampMs {
+						entity.CachedCrawls[i] = e.copyCrawlContextAndUploadToCos(ctx, req, r.CrawlContext)
+					}
 					crawlReplaced = true
 					break
 				}
 			}
 
 			if !crawlReplaced {
-				entity.CachedCrawls = append(entity.CachedCrawls, r.CrawlContext)
+				entity.CachedCrawls = append(entity.CachedCrawls, e.copyCrawlContextAndUploadToCos(ctx, req, r.CrawlContext))
 			}
 		}
 
-		if r.ParseContext != nil {
+		if r.ParseContext != nil && r.ParseContext.Success {
 			parseReplaced := false
 			for i, parse := range entity.CachedParses {
 				if parse == nil || parse.ParserKey == r.ParseContext.ParserKey {
@@ -653,6 +676,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		contextLog(ctx, fmt.Sprintf(" [Ret %s]", resultSource))
 		contextObserver(ctx, "async_retrieve", perfExtra1, perfExtra2, perfExtra3).Observe(elapsedSeconds)
 		reqFinishChan <- 1
+		defer close(reqFinishChan)
 	}()
 
 	if req.TimeoutMs < 100 {
@@ -681,47 +705,41 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 	doneChan := make(chan int, 1)
 
 	e.asyncWorkerCall("retrieve_cycle", func() {
-		defer close(globalCacheDoneChan)
-		defer close(realtimeCacheDoneChan)
-		defer close(asyncCacheDoneChan)
-		defer close(crawlAndParseChan)
 		defer close(doneChan)
-		defer close(reqFinishChan)
 
 		barrier := 3
 		for barrier > 0 {
 			select {
 			case <-globalCacheDoneChan:
+				globalCacheDoneChan = nil
 				barrier --
 			case <-realtimeCacheDoneChan:
+				realtimeCacheDoneChan = nil
 				barrier --
 			case <-asyncCacheDoneChan:
+				asyncCacheDoneChan = nil
 				// Evaluate cache entity
 				ret := h.asyncCacheResult.Load()
 				redo := e.needRedoCrawlAndParse(ctx, req, ret);
 				if redo {
-					timeoutMs := int32(60 * 1000)
-					// TODO(wanghaocheng): Optimize this
-					// to reduce overseas bandwidth
-					if req.ForeignHint {
-						timeoutMs = 10 * 1000
-					}
 					e.crawlAndParse(&CrawlAndParseTask{
 						Ctx:		context.WithoutCancel(ctx),
 						Req:		req,
-						TimeoutMs:	timeoutMs,
+						CacheEntity:	ret,
+						TimeoutMs:	60 * 1000,
 						BypassCache:	true,
 						Callback:	func(res *CrawlAndParseResult, err error) {
-							defer func() { crawlAndParseChan <- 1 }()
+							defer func() { close(crawlAndParseChan) }()
 							if res != nil {
 								h.crawlAndParseResult.Store(res)
 							}
 						},
 					})
 				} else {
-					e.asyncWorkerCall("finalize", func() { crawlAndParseChan <- 1 })
+					e.asyncWorkerCall("finalize", func() { close(crawlAndParseChan) })
 				}
 			case <-crawlAndParseChan:
+				crawlAndParseChan = nil
 				barrier --
 			}
 		}
@@ -738,7 +756,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 
 		// Refresh cache
 		crResult := h.crawlAndParseResult.Load()
-		if crResult != nil {
+		if crResult != nil && !req.BypassCache {
 			e.doCacheRefresh(ctx, req, h.asyncCacheResult.Load(), crResult)
 		}
 
@@ -811,7 +829,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		e.readCache(&CacheReaderTask{
 			Key:		fmt.Sprintf("crawl:%d", city.Hash64([]byte(req.Url))),
 			Callback:	func(ret string, err error) {
-				defer func() { globalCacheDoneChan <- 1 }()
+				defer func() { close(globalCacheDoneChan) }()
 				elapsedSeconds := time.Since(startTime).Seconds()
 				if err != nil || ret == "none" {
 					contextObserver(ctx, "global_cache", "miss", "", "").Observe(elapsedSeconds)
@@ -835,7 +853,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		e.readCache(&CacheReaderTask{
 			Key:		fmt.Sprintf("crawl_rt:%d", city.Hash64([]byte(req.Url))),
 			Callback:	func(ret string, err error) {
-				defer func() { realtimeCacheDoneChan <- 1 }()
+				defer func() { close(realtimeCacheDoneChan) }()
 				elapsedSeconds := time.Since(startTime).Seconds()
 				if err != nil || ret == "none" {
 					contextObserver(ctx, "realtime_cache", "miss", "", "").Observe(elapsedSeconds)
@@ -859,14 +877,19 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		e.readCache(&CacheReaderTask{
 			Key:		fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(req.Url))),
 			Callback:	func(ret string, err error) {
-				defer func() { asyncCacheDoneChan <- 1 }()
+				var perfExtra2, perfExtra3 string
 				elapsedSeconds := time.Since(startTime).Seconds()
+				defer func() {
+					close(asyncCacheDoneChan)
+					contextObserver(ctx, "async_cache", perfExtra2, perfExtra3, "").Observe(elapsedSeconds)
+				}()
 				if err != nil {  // Cache miss
-					contextObserver(ctx, "async_cache", "miss", "", "").Observe(elapsedSeconds)
+					perfExtra2 = "miss"
 					contextLog(ctx, fmt.Sprintf( "[ACache miss %f]", elapsedSeconds))
 					return
 				}
-				contextObserver(ctx, "async_cache", "hit", "", "").Observe(elapsedSeconds)
+				perfExtra2 = "hit"
+				perfExtra3 = "fake"
 				contextLog(ctx, fmt.Sprintf( "[ACache hit %f]", elapsedSeconds))
 
 				cacheEntity := &pb.CacheEntity{}
@@ -874,6 +897,12 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				if err != nil {
 					glog.Error("Failed to unmarshal protobuf for async cache, Url = ", req.Url)
 				} else {
+					for _, parse := range cacheEntity.CachedParses {
+						if parse.Success {
+							perfExtra3 = "real"
+							break
+						}
+					}
 					h.asyncCacheResult.Store(cacheEntity)
 				}
 			},
@@ -934,13 +963,18 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 
 func (e *Executor) crawlAndParse(r *CrawlAndParseTask) {
 	e.asyncWorkerCall("crawl_and_parse", func() {
-		res, err := e.doCrawlAndParse(r.Ctx, r.Req, r.BypassCache, r.TimeoutMs)
+		res, err := e.doCrawlAndParse(r)
 		r.Callback(res, err)
 	})
 }
 
 func (e *Executor) syncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.RetrieveResponse {
-	res, _ := e.doCrawlAndParse(ctx, req, req.BypassCache, req.TimeoutMs)
+	res, _ := e.doCrawlAndParse(&CrawlAndParseTask {
+		Ctx:		ctx,
+		Req:		req,
+		BypassCache:	req.BypassCache,
+		TimeoutMs:	req.TimeoutMs,
+	})
 	return res.Res
 }
 
@@ -948,8 +982,8 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 	defer func() {
 		if r := recover(); r != nil {
 			glog.Error("Panic: ", r, "\n", string(debug.Stack()))
-			glog.Flush()
 		}
+		glog.Flush()
 	}()
 	contextLog(ctx, fmt.Sprintf(" [BizDef %s]", req.BizDef))
 	contextLog(ctx, fmt.Sprintf(" [URL %s]", req.Url))
@@ -967,8 +1001,14 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 	return e.asyncRetrieve(ctx, req)
 }
 
-func (e *Executor) doCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest, bypassCache bool, timeoutMs int32) (*CrawlAndParseResult, error) {
+func (e *Executor) doCrawlAndParse(t *CrawlAndParseTask) (*CrawlAndParseResult, error) {
 	startTime := time.Now()
+
+	ctx := t.Ctx
+	req := t.Req
+	bypassCache := t.BypassCache
+	timeoutMs := t.TimeoutMs
+
 	perfExtra1, perfExtra2, perfExtra3 := "success", "", ""
 	defer func() {
 		elapsedSeconds := time.Since(startTime).Seconds()
@@ -978,6 +1018,9 @@ func (e *Executor) doCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest,
 	if timeoutMs == 0 {
 		timeoutMs = req.TimeoutMs
 	}
+
+	var crawlContext *pb.CrawlContext
+
 	bypassCache = bypassCache || req.BypassCache
 	if !bypassCache {
 		cacheLookup := func(prefix string, cache string) *ppb.ParseContentResponse {
@@ -1022,36 +1065,56 @@ func (e *Executor) doCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest,
 				Res:	convertParseResult(ctx, parsed),
 			}, nil
 		}
+	} else {
+		if req.RetrieveType == pb.RetrieveType_PDF && t.CacheEntity != nil {
+			for _, c := range t.CacheEntity.CachedCrawls {
+				if c != nil && c.Success && c.ContentLen > 0 {
+					if len(c.ContentCosnPath) > 0 {
+						content, err := downloadFromCos(c.ContentCosnPath)
+						if err != nil {
+							glog.Error("Failed to download content from cosn: path = ", c.ContentCosnPath)
+						} else {
+							c.Content = content
+						}
+					}
+
+					if len(c.Content) > 0 {
+						glog.Info("Cache entity assigned.")
+						crawlContext = c
+						break
+					} else {
+						glog.Error("Found cache entity with zero length, url = ", req.Url)
+					}
+				}
+			}
+		}
 	}
 
-	// TODO: parallel crawl from multiple region
-	region := "BJ"
-	if req.ForeignHint {
-		region = "TOK"
-	} else if rand.Intn(100) < 60 {
-		region = "BJNEW"
-	}
-	crawlContext, err := e.invokeCrawl(ctx, req, region, timeoutMs)
-	if err != nil {
-		perfExtra1 = "crawl_failed"
-		contextLog(ctx, fmt.Sprintf(" [CrawlFailed %s]", err.Error()))
-		return &CrawlAndParseResult{
-			Res:	&pb.RetrieveResponse{
-				RetCode:	ERR_CRAWL_FAILED,
-			},
-			CrawlContext: crawlContext,
-		}, nil
-	}
+	// Reinvoke crawl crawl
+	if crawlContext == nil {
+		var err error
+		crawlContext, err = e.invokeCrawl(ctx, req)
+		if err != nil {
+			perfExtra1 = "crawl_failed"
+			contextLog(ctx, fmt.Sprintf(" [CrawlFailed %s]", err.Error()))
+			return &CrawlAndParseResult{
+				Res:	&pb.RetrieveResponse{
+					RetCode:	ERR_CRAWL_FAILED,
+				},
+				CrawlContext: crawlContext,
+			}, nil
+		}
 
-	if !crawlContext.Success {
-		perfExtra1 = "crawl_failed"
-		contextLog(ctx, fmt.Sprintf(" [CrawlFailed %s]", crawlContext.ErrorMessage))
-		return &CrawlAndParseResult{
-			Res:	&pb.RetrieveResponse{
-				RetCode:	ERR_CRAWL_FAILED,
-			},
-			CrawlContext: crawlContext,
-		}, nil
+		if !crawlContext.Success {
+			perfExtra1 = "crawl_failed"
+			contextLog(ctx, fmt.Sprintf(" [CrawlFailed %s]", crawlContext.ErrorMessage))
+			return &CrawlAndParseResult{
+				Res:	&pb.RetrieveResponse{
+					RetCode:	ERR_CRAWL_FAILED,
+				},
+				CrawlContext: crawlContext,
+			}, nil
+		}
 	}
 
 	elapsed := int32(time.Since(startTime).Milliseconds())
@@ -1065,7 +1128,7 @@ func (e *Executor) doCrawlAndParse(ctx context.Context, req *pb.RetrieveRequest,
 			CrawlContext:	crawlContext,
 		}, nil
 	}
-	parsed, parseContext, err := e.invokeParse(ctx, req, crawlContext.Content, timeoutMs - elapsed)
+	parsed, parseContext, err := e.invokeParse(ctx, req, crawlContext, timeoutMs - elapsed)
 	if err != nil {
 		perfExtra1 = "parse_failed"
 		contextLog(ctx, fmt.Sprintf(" [ParseFailed %s]", err.Error()))

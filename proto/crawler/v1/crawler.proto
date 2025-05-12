@@ -68,6 +68,7 @@ enum ERROR_CODE {
   URL_TOO_LONG_ERR = 2;
   INTERNAL_ERR = 3;
   TRANS_ENCODING_ERR = 4;
+  CONTENT_TOO_LONG_ERR = 5;
 }
 
 enum ResponseType {
@@ -115,6 +116,7 @@ message CrawlRequest {
   bool enable_render = 20;
   ImageUploadMethod image_upload_method = 21;
   ImageCosInfo image_cos_info = 22;
+  int32 max_content_length = 23;
 }
 
 message CrawlResponse {
@@ -136,6 +138,7 @@ message CrawlResponse {
   string crawl_pod_ip = 16;
   bytes markdown_content = 17; // gzip compress
   int32 markdown_content_len = 18;
+  string content_type = 19;
 }
 
 enum RetCode {
