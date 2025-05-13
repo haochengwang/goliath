@@ -555,6 +555,8 @@ type RetrieveStatusHolder struct {
 
 	// Final response
 	retrieveResponse	atomic.Pointer[pb.RetrieveResponse]
+
+	minReturnTimeMs		atomic.Int32
 }
 
 // Whether need to redo crawl & parse based on the content of the cache
@@ -742,6 +744,20 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 	crawlAndParseChan := make(chan int)
 	doneChan := make(chan int, 1)
 
+	updateMinReturnTime := func(t int32) {
+		for {
+			old := h.minReturnTimeMs.Load()
+
+			if old > 0 && old < t {
+				return
+			}
+
+			if h.minReturnTimeMs.CompareAndSwap(old, t) {
+				return
+			}
+		}
+	}
+
 	e.asyncWorkerCall("retrieve_cycle", func() {
 		defer close(doneChan)
 
@@ -759,6 +775,15 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				// Evaluate cache entity
 				ret := h.asyncCacheResult.Load()
 				redo := e.needRedoCrawlAndParse(ctx, req, ret);
+				if ret != nil && ret.CachedParses != nil {
+					for _, parse := range ret.CachedParses {
+						if parse.Success {
+							elapsedMs := int32(time.Since(startTime).Milliseconds())
+							updateMinReturnTime(elapsedMs)
+							break
+						}
+					}
+				}
 				if redo {
 					e.crawlAndParse(&CrawlAndParseTask{
 						Ctx:		context.WithoutCancel(ctx),
@@ -769,6 +794,10 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 						Callback:	func(res *CrawlAndParseResult, err error) {
 							defer func() { close(crawlAndParseChan) }()
 							if res != nil {
+								if res.Res != nil && res.Res.Result != nil && len(res.Res.Result.Content) > 0{
+									elapsedMs := int32(time.Since(startTime).Milliseconds())
+									updateMinReturnTime(elapsedMs)
+								}
 								h.crawlAndParseResult.Store(res)
 							}
 						},
@@ -804,6 +833,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		// Send to kafka
 		metadata := &pb.RetrieveRequestLogMetadata {
 			ResultSource:		resultSource,
+			MinReturnTime:		h.minReturnTimeMs.Load(),
 		}
 
 		if p := h.asyncCacheResult.Load(); p != nil {
@@ -886,6 +916,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 					glog.Error("Failed to unmarshal proto from global cache, Url = ", req.Url)
 				} else {
 					h.globalCacheResult.Store(parseResult)
+					updateMinReturnTime(int32(elapsedSeconds * 1000))
 				}
 			},
 		})
@@ -910,6 +941,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 					glog.Error("Failed to unmarshal proto from realtime cache, Url = ", req.Url)
 				} else {
 					h.realtimeCacheResult.Store(parseResult)
+					updateMinReturnTime(int32(elapsedSeconds * 1000))
 				}
 			},
 		})
@@ -918,19 +950,19 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		e.readCache(&CacheReaderTask{
 			Key:		fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(req.Url))),
 			Callback:	func(ret string, err error) {
-				var perfExtra2, perfExtra3 string
+				var perfExtra1, perfExtra2, perfExtra3 string
 				elapsedSeconds := time.Since(startTime).Seconds()
 				defer func() {
 					close(asyncCacheDoneChan)
-					contextObserver(ctx, "async_cache", perfExtra2, perfExtra3, "").Observe(elapsedSeconds)
+					contextObserver(ctx, "async_cache", perfExtra1, perfExtra2, perfExtra3).Observe(elapsedSeconds)
 				}()
 				if err != nil {  // Cache miss
-					perfExtra2 = "miss"
+					perfExtra1 = "miss"
 					contextLog(ctx, fmt.Sprintf( "[ACache miss %f]", elapsedSeconds))
 					return
 				}
-				perfExtra2 = "hit"
-				perfExtra3 = "fake"
+				perfExtra1 = "hit"
+				perfExtra2 = "fake"
 				contextLog(ctx, fmt.Sprintf( "[ACache hit %f]", elapsedSeconds))
 
 				cacheEntity := &pb.CacheEntity{}
@@ -940,7 +972,15 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 				} else {
 					for _, parse := range cacheEntity.CachedParses {
 						if parse.Success {
-							perfExtra3 = "real"
+							updateMinReturnTime(int32(elapsedSeconds * 1000))
+							perfExtra2 = "real"
+							if len(parse.Result.Content) == 0 {
+								perfExtra3 = "zero_content"
+							} else if len(parse.Result.Content) <= 100 {
+								perfExtra3 = "short_content"
+							} else {
+								perfExtra3 = "long_content"
+							}
 							break
 						}
 					}
@@ -959,37 +999,43 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 	defer timer.Stop()
 
 	fallback := func() *pb.RetrieveResponse {
-			if p := h.crawlAndParseResult.Load();
-				p != nil && p.ParseContext != nil && p.ParseContext.Success {
-				perfExtra2 = "crawl_and_parse"
-				resultSource = "CrawlAndParse"
-				return &pb.RetrieveResponse{
-					Result:	p.ParseContext.Result,
-				}
+		var r *pb.RetrieveResponse
+		if p := h.crawlAndParseResult.Load();
+			p != nil && p.ParseContext != nil && p.ParseContext.Success {
+			perfExtra2 = "crawl_and_parse"
+			resultSource = "CrawlAndParse"
+			r = &pb.RetrieveResponse{
+				Result:	p.ParseContext.Result,
 			}
+		} else if p := e.convertCacheEntity(ctx, req, h.asyncCacheResult.Load()); p != nil {
+			perfExtra2 = "async_cache"
+			resultSource = "ACache"
+			r = p
+		} else if p := h.realtimeCacheResult.Load(); p != nil {
+			perfExtra2 = "realtime_cache"
+			resultSource = "RCache"
+			r = convertParseResult(ctx, p)
+		} else if p := h.globalCacheResult.Load(); p != nil {
+			perfExtra2 = "global_cache"
+			resultSource = "GCache"
+			r = convertParseResult(ctx, p)
+		}
 
-			if p := e.convertCacheEntity(ctx, req, h.asyncCacheResult.Load()); p != nil {
-				perfExtra2 = "async_cache"
-				resultSource = "ACache"
-				return p
+		if r != nil {
+			if len(r.Result.Content) == 0 {
+				perfExtra3 = "zero_content"
+			} else if len(r.Result.Content) <= 100 {
+				perfExtra3 = "short_content"
+			} else {
+				perfExtra3 = "long_content"
 			}
+			return r
+		}
 
-			if p := h.realtimeCacheResult.Load(); p != nil {
-				perfExtra2 = "realtime_cache"
-				resultSource = "RCache"
-				return convertParseResult(ctx, p)
-			}
-
-			if p := h.globalCacheResult.Load(); p != nil {
-				perfExtra2 = "global_cache"
-				resultSource = "GCache"
-				return convertParseResult(ctx, p)
-			}
-
-			perfExtra1 = "error"
-			return &pb.RetrieveResponse{
-				RetCode:	ERR_INTERNAL_ERROR,
-			}
+		perfExtra1 = "error"
+		return &pb.RetrieveResponse{
+			RetCode:	ERR_INTERNAL_ERROR,
+		}
 	}
 
 	select {

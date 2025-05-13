@@ -28,7 +28,7 @@ func main() {
 	//url := "https://zhidao.baidu.com/question/1708281467644467820.html"
 	//url := "https://zhuanlan.zhihu.com/p/379009259"
 	key := fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(*url)))
-	//key = "Goliath|Async|18207729575868377158"
+	//key := "Goliath|Async|4328966043110512250"
 	ret, err := redisClient.Get(context.Background(), key).Result()
 
 	if err != nil {  // Cache miss
