@@ -986,7 +986,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 							perfExtra2 = "real"
 							if len(parse.Result.Content) == 0 {
 								perfExtra3 = "zero_content"
-							} else if len(parse.Result.Content) <= 100 {
+							} else if len(parse.Result.Content) <= 150 {
 								perfExtra3 = "short_content"
 							} else {
 								perfExtra3 = "long_content"
@@ -1034,7 +1034,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		if r != nil {
 			if len(r.Result.Content) == 0 {
 				perfExtra3 = "zero_content"
-			} else if len(r.Result.Content) <= 100 {
+			} else if len(r.Result.Content) <= 150 {
 				perfExtra3 = "short_content"
 			} else {
 				perfExtra3 = "long_content"
