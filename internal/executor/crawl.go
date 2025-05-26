@@ -18,11 +18,34 @@ import (
 )
 
 func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*pb.CrawlContext, error) {
-	// TODO: parallel crawl from multiple region
+	foreign := req.ForeignHint
+	parsedUrl, err := url.Parse(req.Url)
+	if err != nil {
+		glog.Error("Failed to parse URL: ", parsedUrl)
+	}
+
+	for _, domain := range(e.conf.BlacklistDomain) {
+		if parsedUrl.Hostname() == domain {
+			glog.Info("URL Hit blacklist: ", req.Url)
+			return &pb.CrawlContext {
+				CrawlerKey:		"_NA",
+				Success:		false,
+				ErrorMessage:		"Hit blacklist",
+			}, err
+		}
+	}
+
+	for _, domain := range(e.conf.ForeignCrawlDomain) {
+		if parsedUrl.Hostname() == domain && !foreign {
+			glog.Info("URL foreign crawl rewrite: ", req.Url)
+			foreign = true
+		}
+	}
+
 	region := "BJ"
 	timeoutMs := int32(60 * 1000)
 	maxContentLen := int32(30 * 1024 * 1024)
-	if req.ForeignHint {
+	if foreign {
 		// TODO(wanghaocheng): Avoid heavy traiffc via Tokyo
 		if strings.HasSuffix(req.Url, "pdf") {
 			region = "SV-ALI"
@@ -33,16 +56,11 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 			timeoutMs = int32(10 * 1000)
 			maxContentLen = int32(10 * 1024 * 1024)
 		}
-	// TODO: whitelist this
-	} else if strings.HasPrefix(req.Url, "https://zhuanlan.zhihu.com") && rand.Intn(100) < 5 {
-		region = "BJ:RENDER"
 	} else if rand.Intn(100) < 60 {
 		region = "BJNEW"
 	}
 	if region == "BJ:RENDER" {
 		return e.invokeRenderCrawl(ctx, req, region, timeoutMs)
-	//} else if region == "SV-ALI-NGINX" {
-	//	return e.invokeNginxCrawl(ctx, req, region, timeoutMs)
 	} else {
 		return e.invokeNormalCrawl(ctx, req, region, timeoutMs, maxContentLen)
 	}

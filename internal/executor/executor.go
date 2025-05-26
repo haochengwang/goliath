@@ -16,7 +16,7 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v2/clients"
 	"github.com/nacos-group/nacos-sdk-go/v2/clients/config_client"
 	"github.com/nacos-group/nacos-sdk-go/v2/common/constant"
-	"github.com/nacos-group/nacos-sdk-go/v2/vo"
+	// "github.com/nacos-group/nacos-sdk-go/v2/vo"
 	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	redis "github.com/redis/go-redis/v9"
@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/encoding/protojson"
 	"example.com/goliath/internal/utils"
+	"example.com/goliath/internal/config"
 	pb "example.com/goliath/proto/goliath/v1"
 	cpb "example.com/goliath/proto/crawler/v1"
 	ppb "example.com/goliath/proto/parser/v1"
@@ -65,6 +66,7 @@ var (
 )
 
 type Executor struct {
+	conf		*config.JsonConfig
 	crawlerAddrs	map[string]string
 	searchAddrs	map[string]string
 	parserAddrs	map[string]string
@@ -151,12 +153,18 @@ func createGrpcConn(addr string) (*grpc.ClientConn, error) {
 }
 
 func NewExecutor() *Executor {
+	conf, err := config.LoadConfig("./conf/CONFIG.json")
+	if err != nil {
+		glog.Fatal(err)
+	}
+
 	redisClient := redis.NewClient(&redis.Options{
 		Addr:		"10.3.0.103:6379",
 		Password:	"2023@Ystech",
 		DB:		0,
 	})
 
+	/*
 	nacosClient := initNacosConfigClient()
 
 	conf, err := nacosClient.GetConfig(vo.ConfigParam{
@@ -181,6 +189,7 @@ func NewExecutor() *Executor {
 	if err != nil {
 		glog.Fatal(err)
 	}
+	*/
 
 	// Initialize kafka producer
 	brokers := []string{"10.3.0.23:9092"}
@@ -195,6 +204,7 @@ func NewExecutor() *Executor {
 
 	workerChan := make(chan *WorkerTask)
 	e := &Executor{
+		conf:		conf,
 		crawlerAddrs:	map[string]string {
 			"BJ": 		"10.3.0.90:9023",
 			"BJNEW":	"10.3.32.116:9023",
@@ -212,7 +222,7 @@ func NewExecutor() *Executor {
 			"BJ-MED":	"10.3.16.19:50056",
 		},
 		redisClient:		redisClient,
-		nacosClient:		nacosClient,
+		//nacosClient:		nacosClient,
 		kafkaProducer:		kafkaProducer,
 		workerChan:		workerChan,
 		workerWaterlevel:	map[string]*atomic.Int32 {

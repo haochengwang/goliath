@@ -1,0 +1,57 @@
+{
+	"crawlers": {
+		"BJ": {
+		},
+		"BJNEW": {
+		},
+		"TOK": {
+		}
+	},
+	"parsers": {
+		"BJ": {
+		},
+		"BJ-MED": {
+		}
+	},
+	"blacklist_domain": [
+		"zhuanlan.zhihu.com"
+	],
+	"foreign_crawl_domain": [
+		"huggingface.co",
+		"patents.google.com",
+		"steamcommunity.com",
+		"www.facebook.com",
+		"www.wikiwand.com",
+		"tw.news.yahoo.com",
+		"es.wikipedia.org",
+		"www.reddit.com",
+		"today.line.me",
+		"ran-53008.medium.com",
+		"zh.wikipedia.org",
+		"money.udn.com",
+		"www.rfa.org",
+		"kmweb.moa.gov.tw",
+		"www.wzsjcy.gov.cn",
+		"chinadigitaltimes.net",
+		"www.threads.net",
+		"www.nytimes.com",
+		"news.cnyes.com",
+		"vocus.cc",
+		"mirror.xyz",
+		"archive.org",
+		"www.hk01.com",
+		"www.behance.net",
+		"blog.udn.com",
+		"www.bbc.com",
+		"m.youtube.com",
+		"www.tiktok.com",
+		"www.books.com.tw",
+		"www.hpa.gov.tw",
+		"www.st.com",
+		"play.google.com",
+		"www.dz-x.net",
+		"www.rfi.fr",
+		"www.goodreads.com",
+		"ir.lib.nycu.edu.tw"
+	]
+}

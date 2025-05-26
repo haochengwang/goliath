@@ -1,29 +1,49 @@
 package config
 
 import (
-	"fmt"
+	"encoding/json"
+	"os"
+
+	"github.com/golang/glog"
 )
 
-type CrawlerEndpoint struct {
-	Ip	string
-	Port	int32
-	Nginx	bool
+type ServiceEndpoint struct {
+	Host	string	`json:"host"`
+	Port	int32	`json:"port"`
 }
 
-type ParserEndpoint struct {
-	Ip	string
-	Port	int32
+type JsonConfig struct {
+	CrawlerEndpoints	map[string]ServiceEndpoint	`json:"crawlers"`
+	ParserEndpoints		map[string]ServiceEndpoint	`json:"parsers"`
+	BlacklistDomain		[]string			`json:"blacklist_domain"`
+	ForeignCrawlDomain	[]string			`json:"foreign_crawl_domain"`
 }
 
-type Config struct {
-	CrawlerEndpoints	map[string]CrawlerEndpoint
-	ParserEndpoints		map[string]ParserEndpoint
-}
+var (
+	conf	JsonConfig
+)
 
-func (c* Config) GetCrawlerEndpoints() {
-	fmt.Println("Fuck")
-}
+func LoadConfig(filename string) (*JsonConfig, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		glog.Error("Failed to read file: ", filename, ", err: ", err)
+		return nil, err
+	}
 
-func (c* Config) GetParserEndpoints() {
-	fmt.Println("Fuck")
+	result := &JsonConfig{}
+	err = json.Unmarshal(data, &result)
+	if err != nil {
+		glog.Error("Failed to parse json: ", err)
+		return nil, err
+	}
+
+	// For debug purposes
+	s, err := json.Marshal(result)
+	if err != nil {
+		glog.Error("Failed to marshal json: ", err)
+		return nil, err
+	}
+	glog.Info(s)
+
+	return result, nil
 }
