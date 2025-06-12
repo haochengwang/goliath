@@ -52,6 +52,8 @@ var (
 		Help:	"Goliath Gauge",
 	}, []string{"tag", "extra1", "extra2", "extra3", "extra4"})
 
+	cosCrawlBucket = "web-crawl-1319140468"
+
 	// Ret codes
 	SUCCESS			int32 = 0
 	ERR_INVALID_ARGUMENT	int32 = 1
@@ -345,6 +347,34 @@ func (e *Executor) convertCacheEntity(ctx context.Context, req *pb.RetrieveReque
 	return nil
 }
 
+func convertImageCrawlContext(ctx context.Context, req *pb.RetrieveRequest, c *pb.CrawlContext) *CrawlAndParseResult {
+	if c == nil {
+		return nil
+	}
+
+	r := &CrawlAndParseResult {
+		Res:	&pb.RetrieveResponse {
+			Result: &pb.RetrieveResult {
+				Url:		req.Url,
+				Content:	c.Content,
+			},
+		},
+		CrawlContext:	c,
+		ParseContext:	&pb.ParseContext {
+			ParserKey:		"NA",
+			ParseTimestampMs:	time.Now().UnixMilli(),
+			Success:		true,
+			Result:	&pb.RetrieveResult {
+				Url:		req.Url,
+				Content:	c.Content,
+			},
+			ContentLen:		int64(len(c.Content)),
+		},
+	}
+
+	return r
+}
+
 func convertParseResult(ctx context.Context, p *ppb.ParseContentResponse) *pb.RetrieveResponse {
 	if p == nil {
 		return nil
@@ -584,7 +614,7 @@ func (e *Executor) needRedoCrawlAndParse(ctx context.Context, req *pb.RetrieveRe
 		ms := p.ParseTimestampMs
 		parseTimestamp := time.Unix(ms / 1000, ms % 1000 * 1000)
 		// TODO(wanghaocheng) optimize me
-		if req.RetrieveType == pb.RetrieveType_PDF {
+		if req.RetrieveType == pb.RetrieveType_PDF || req.RetrieveType == pb.RetrieveType_IMAGE {
 			return false
 		}
 		if time.Since(parseTimestamp).Seconds() > 86400 {
@@ -604,7 +634,7 @@ func (e *Executor) copyCrawlContextAndUploadToCos(ctx context.Context, req *pb.R
 		content := c.Content
 		cosnPath = fmt.Sprintf("crawl/%d-%d-%d/url-%d", now.Year(), now.Month(), now.Day(), city.Hash64([]byte(req.Url)))
 		e.asyncWorkerCall("upload_to_cos", func() {
-			uploadToCos(cosnPath, content)
+			uploadToCos(cosCrawlBucket, cosnPath, content)
 		})
 	}
 	return &pb.CrawlContext {
@@ -744,6 +774,16 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		return &pb.RetrieveResponse{
 			RetCode:	ERR_INVALID_ARGUMENT,
 			DebugString:	fmt.Sprintf("Too long url: %s", req.Url),
+		}
+	}
+
+	if req.Destination != nil && req.Destination.DestinationType == pb.RetrieveDestinationType_COS &&
+			req.RetrieveType != pb.RetrieveType_IMAGE {
+		contextLog(ctx, fmt.Sprintf(" [InvalidDest]"))
+		perfExtra1, perfExtra2 = "error", "invalid_dest"
+		return &pb.RetrieveResponse{
+			RetCode:	ERR_INVALID_ARGUMENT,
+			DebugString:	fmt.Sprintf("Only image support COS destination"),
 		}
 	}
 
@@ -1055,6 +1095,19 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 
 	res := fallback()
 	h.retrieveResponse.Store(res)
+
+	if req.Destination != nil && res != nil && res.RetCode == 0 && res.Result != nil && res.Result.Content != nil &&
+			req.Destination.DestinationType == pb.RetrieveDestinationType_COS {
+		bucket := req.Destination.CosBucket
+		path := req.Destination.CosPath
+		content := res.Result.Content
+
+		err := uploadToCos(bucket, path, content)
+		if err != nil {
+			glog.Error("Failed to write to COS: ", err)
+		}
+	}
+
 	return res
 }
 
@@ -1163,11 +1216,11 @@ func (e *Executor) doCrawlAndParse(t *CrawlAndParseTask) (*CrawlAndParseResult, 
 			}, nil
 		}
 	} else {
-		if req.RetrieveType == pb.RetrieveType_PDF && t.CacheEntity != nil {
+		if (req.RetrieveType == pb.RetrieveType_PDF || req.RetrieveType == pb.RetrieveType_IMAGE) && t.CacheEntity != nil {
 			for _, c := range t.CacheEntity.CachedCrawls {
 				if c != nil && c.Success && c.ContentLen > 0 {
 					if len(c.ContentCosnPath) > 0 {
-						content, err := downloadFromCos(c.ContentCosnPath)
+						content, err := downloadFromCos(cosCrawlBucket, c.ContentCosnPath)
 						if err != nil {
 							glog.Error("Failed to download content from cosn: path = ", c.ContentCosnPath)
 						} else {
@@ -1212,6 +1265,11 @@ func (e *Executor) doCrawlAndParse(t *CrawlAndParseTask) (*CrawlAndParseResult, 
 				CrawlContext: crawlContext,
 			}, nil
 		}
+	}
+
+	// No need to parse for image
+	if req.RetrieveType == pb.RetrieveType_IMAGE {
+		return convertImageCrawlContext(ctx, req, crawlContext), nil
 	}
 
 	elapsed := int32(time.Since(startTime).Milliseconds())

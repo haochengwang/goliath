@@ -27,6 +27,7 @@ func main() {
 	//url := "https://mmedispa.com/2025/04/21/toronto-2025-reveal-simple-effective-acne-removal-secrets/"
 	//url := "https://zhidao.baidu.com/question/1708281467644467820.html"
 	//url := "https://zhuanlan.zhihu.com/p/379009259"
+	*url = "https://stream.881903.com/public/32dc63064552445f0aa12c06293f38cc/2025/05/f92b9c8cf9108979eaefab8decb5a495.jpg"
 	key := fmt.Sprintf("Goliath|Async|%d", city.Hash64([]byte(*url)))
 	//key := "Goliath|Async|4328966043110512250"
 	ret, err := redisClient.Get(context.Background(), key).Result()

@@ -45,9 +45,13 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 	region := "BJ"
 	timeoutMs := int32(60 * 1000)
 	maxContentLen := int32(30 * 1024 * 1024)
+	retryTimes := int32(1)
 	if foreign {
 		// TODO(wanghaocheng): Avoid heavy traiffc via Tokyo
-		if strings.HasSuffix(req.Url, "pdf") {
+		if req.RetrieveType == pb.RetrieveType_IMAGE {
+			region = "SV-ALI"
+			retryTimes = 3
+		} else if strings.HasSuffix(req.Url, "pdf") {
 			region = "SV-ALI"
 		} else if rand.Intn(100) < 40 {
 			region = "SV-ALI"
@@ -62,7 +66,7 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 	if region == "BJ:RENDER" {
 		return e.invokeRenderCrawl(ctx, req, region, timeoutMs)
 	} else {
-		return e.invokeNormalCrawl(ctx, req, region, timeoutMs, maxContentLen)
+		return e.invokeNormalCrawl(ctx, req, region, timeoutMs, maxContentLen, retryTimes)
 	}
 }
 
@@ -276,52 +280,67 @@ func (e *Executor) invokeRenderCrawl(ctx context.Context, req *pb.RetrieveReques
 	}, nil
 }
 
-func (e *Executor) invokeNormalCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerRegion string, timeoutMs int32, maxContentLen int32) (*pb.CrawlContext, error) {
+func (e *Executor) invokeNormalCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerRegion string, timeoutMs int32, maxContentLen int32, retryTimes int32) (*pb.CrawlContext, error) {
 	startTime := time.Now()
-
-	conn, err := createGrpcConn(e.crawlerAddrs[crawlerRegion])
-	if err != nil {
-		glog.Error("Failed to create grpc connection: ", err)
-		return &pb.CrawlContext{
-			CrawlerKey:		crawlerRegion,
-			CrawlTimestampMs:	startTime.UnixMilli(),
-			Success:		false,
-			ErrorMessage:		err.Error(),
-		}, err
-	}
-	defer conn.Close()
-
-	c := cpb.NewCrawlServiceClient(conn)
-	innerCtx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs) * time.Millisecond)
-	defer cancel()
 
 	var estimatedParseTimeMs int32 = 100
 	if req.RetrieveType == pb.RetrieveType_PDF || req.RetrieveType == pb.RetrieveType_VIDEO_SUMMARY {
 		estimatedParseTimeMs = 1000
 	}
-	r, err := c.Download(innerCtx, &cpb.CrawlRequest{
-		Url:			req.Url,
-		RequestType:		cpb.RequestType_GET,
-		UaType:			cpb.UAType_PC,
-		CrawlType:		cpb.CrawlType_HTML,
-		TimeoutMs:		timeoutMs - estimatedParseTimeMs,
-		MaxContentLength:	maxContentLen,
-		TaskInfo:	&cpb.TaskInfo{
-			TaskName:	req.BizDef,
-		},
-	})
 
-	if err != nil {
-		elapsedSeconds := time.Since(startTime).Seconds()
-		contextObserver(ctx, "crawl", "error", crawlerRegion, "").Observe(elapsedSeconds)
-		err = fmt.Errorf("Crawl failed: Err = %v", err)
-		return &pb.CrawlContext{
-			CrawlerKey:		crawlerRegion,
-			CrawlTimestampMs:	startTime.UnixMilli(),
-			CrawlTimecostMs:	int64(elapsedSeconds * 1000),
-			Success:		false,
-			ErrorMessage:		err.Error(),
-		}, err
+	ct := cpb.CrawlType_HTML
+	if req.RetrieveType == pb.RetrieveType_IMAGE {
+		ct = cpb.CrawlType_IMAGE
+	}
+	var r *cpb.CrawlResponse
+	var err error
+	for retry := int32(0); ; retry++ {
+		conn, err := createGrpcConn(e.crawlerAddrs[crawlerRegion])
+		if err != nil {
+			glog.Error("Failed to create grpc connection, region = ", crawlerRegion, ", err = ", err)
+			return &pb.CrawlContext{
+				CrawlerKey:		crawlerRegion,
+				CrawlTimestampMs:	startTime.UnixMilli(),
+				Success:		false,
+				ErrorMessage:		err.Error(),
+			}, err
+		}
+		defer conn.Close()
+
+		c := cpb.NewCrawlServiceClient(conn)
+		innerCtx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs) * time.Millisecond)
+		defer cancel()
+
+		r, err = c.Download(innerCtx, &cpb.CrawlRequest{
+			Url:			req.Url,
+			RequestType:		cpb.RequestType_GET,
+			UaType:			cpb.UAType_PC,
+			CrawlType:		ct,
+			TimeoutMs:		timeoutMs - estimatedParseTimeMs,
+			MaxContentLength:	maxContentLen,
+			TaskInfo:	&cpb.TaskInfo{
+				TaskName:	req.BizDef,
+			},
+		})
+
+		if err != nil {  // r == nil
+			elapsedSeconds := time.Since(startTime).Seconds()
+			contextObserver(ctx, "crawl", "error", crawlerRegion, "").Observe(elapsedSeconds)
+			if retry < retryTimes {
+				continue
+			}
+			err = fmt.Errorf("Crawl failed: Retry = %d, Err = %v", retry, err)
+
+			return &pb.CrawlContext{
+				CrawlerKey:		crawlerRegion,
+				CrawlTimestampMs:	startTime.UnixMilli(),
+				CrawlTimecostMs:	int64(elapsedSeconds * 1000),
+				Success:		false,
+				ErrorMessage:		err.Error(),
+			}, err
+		}
+
+		break
 	}
 
 	if r.ErrCode != cpb.ERROR_CODE_SUCCESS {
