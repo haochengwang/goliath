@@ -518,12 +518,18 @@ func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, cra
 
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextObserver(ctx, "parse", "success", parserRegion, "").Observe(elapsedSeconds)
+
+	result := convertParseResult(ctx, r).Result
+	// If PublishTime is not parsed, use last modified
+	if len(result.PublishTime) == 0 {
+		result.PublishTime = crawlContext.LastModified
+	}
 	return r, &pb.ParseContext{
 		ParserKey:		parserRegion,
 		ParseTimestampMs:	startTime.UnixMilli(),
 		ParseTimecostMs:	int64(elapsedSeconds * 1000),
 		Success:		true,
-		Result:			convertParseResult(ctx, r).Result,
+		Result:			result,
 		ContentLen:		int64(len(r.Content)),
 	}, err
 }
@@ -1105,6 +1111,15 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 		err := uploadToCos(bucket, path, content)
 		if err != nil {
 			glog.Error("Failed to write to COS: ", err)
+		}
+	}
+
+	// Whether Publish Time is filled
+	if res != nil && res.RetCode == 0 && res.Result != nil {
+		if len(res.Result.PublishTime) > 0 {
+			contextCounter(ctx, "retrieve_have_publish_time", "yes", "", "").Inc()
+		} else {
+			contextCounter(ctx, "retrieve_have_publish_time", "no", "", "").Inc()
 		}
 	}
 

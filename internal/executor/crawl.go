@@ -9,6 +9,7 @@ import (
 	//"mime"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -265,8 +266,6 @@ func (e *Executor) invokeRenderCrawl(ctx context.Context, req *pb.RetrieveReques
 		}, err
 	}
 
-	glog.Info(len(body))
-
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextObserver(ctx, "crawl", "success", crawlerRegion, "").Observe(elapsedSeconds)
 	return &pb.CrawlContext {
@@ -278,6 +277,37 @@ func (e *Executor) invokeRenderCrawl(ctx context.Context, req *pb.RetrieveReques
 		Content:		body,
 		ContentLen:		int64(len(body)),
 	}, nil
+}
+
+func tryFindPublishTime(req *pb.RetrieveRequest, headers string) string {
+	re1, _ := regexp.Compile("/20[0-9][0-9]-[0-1][0-9]-[0-3][0-9]/")
+	if r := re1.FindString(req.Url); len(r) > 2 {
+		glog.Info("URL match regexp1 when trying to parse publish time from url: ", req.Url)
+		return r[1 : 5] + "-" + r[6 : 8] + "-" + r[9 : 11]
+	}
+
+	re2, _ := regexp.Compile("/20[0-9][0-9]/[0-1][0-9]/[0-3][0-9]/")
+	if r := re2.FindString(req.Url); len(r) > 2 {
+		glog.Info("URL match regexp2 when trying to parse publish time from url: ", req.Url)
+		return r[1 : 5] + "-" + r[6 : 8] + "-" + r[9 : 11]
+	}
+
+	re3, _ := regexp.Compile("/20[0-9][0-9][0-1][0-9][0-3][0-9]/")
+	if r := re3.FindString(req.Url); len(r) > 2 {
+		glog.Info("URL match regexp3 when trying to parse publish time from url: ", req.Url)
+		return r[1 : 5] + "-" + r[5 : 7] + "-" + r[7 : 9]
+	}
+
+	if i := strings.Index(headers, "Last-Modified: "); i != -1 {
+		first := i + 15
+		last := i + 15
+		for ; last < len(headers) && headers[last] != '\n'; last ++ {}
+		res := headers[first : last]
+		glog.Info("Found last modified in header, url = ", req.Url, ", res = ", res)
+		return res
+	}
+
+	return ""
 }
 
 func (e *Executor) invokeNormalCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerRegion string, timeoutMs int32, maxContentLen int32, retryTimes int32) (*pb.CrawlContext, error) {
@@ -388,7 +418,8 @@ func (e *Executor) invokeNormalCrawl(ctx context.Context, req *pb.RetrieveReques
 		}, err
 	}
 
-	//glog.Info("Crawl succeed, Url = ", req.Url, ", crawlPod = ", r.CrawlPodIp)
+	//glog.Info("Crawl succeed, Url = ", req.Url, ", crawlPod = ", r.CrawlPodIp, ", respHeaders = ", r.ResponseHeaders)
+
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextObserver(ctx, "crawl", "success", crawlerRegion, "").Observe(elapsedSeconds)
 	return &pb.CrawlContext {
@@ -401,5 +432,6 @@ func (e *Executor) invokeNormalCrawl(ctx context.Context, req *pb.RetrieveReques
 		ContentLen:		int64(len(r.Content)),
 		ContentType:		r.ContentType,
 		ContentEncoding:	r.Encoding,
+		LastModified:		tryFindPublishTime(req, r.ResponseHeaders),
 	}, nil
 }
