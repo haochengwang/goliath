@@ -78,7 +78,7 @@ func GoliathInterceptor(ctx context.Context, req interface{}, info *grpc.UnarySe
 	}()
 
 	if r, ok := req.(*pb.RetrieveRequest); ok {
-		bizdef = fmt.Sprintf("%s_%s", r.BizDef, r.RetrieveType.String())
+		bizdef = fmt.Sprintf("%s_%s_%s", r.BizDef, r.SearchType, r.RetrieveType.String())
 		reqId = r.RequestId
 
 		domain, err := utils.ExtractDomain(r.Url)
