@@ -1,0 +1,62 @@
+syntax = "proto3";
+
+import "proto/goliath/v1/goliath.proto";
+
+option cc_generic_services = true;
+option go_package = "metastone.com/goliath/proto";
+
+package goliath;
+
+message CrawlContext {
+	string crawler_key = 1;
+	int64 crawl_timestamp_ms = 2;
+	bool success = 3;
+	string error_message = 4;
+	int32 http_code = 5;
+	string content_type = 6;
+	string content_encoding = 7;
+	bytes content = 8;
+	int64 crawl_timecost_ms = 9;
+	int64 content_len = 10;
+	string content_cosn_path = 11;
+	string last_modified = 12;
+}
+
+message ParseContext {
+	string parser_key = 1;
+	int64 parse_timestamp_ms = 2;
+	bool success = 3;
+	string error_message = 4;
+	RetrieveResult result = 5;
+	int64 parse_timecost_ms = 6;
+	int64 content_len = 7;
+}
+
+message CacheEntity {
+	string url = 1;
+	repeated CrawlContext cached_crawls = 2;
+	repeated ParseContext cached_parses = 3;
+}
+
+message RetrieveRequestLog {
+	string biz_def = 1;
+	string request_id = 2;
+	string url = 3;
+	string retrieve_type = 4;
+	int32 bypass_cache = 5;
+	int32 foreign_hint = 6;
+	int64 request_timestamp_ms = 7;
+	int32 timeout_ms = 8;
+	int32 timecost_ms = 9;
+	int32 ret_code = 10;
+	string metadata = 11;
+    string search_type = 12;
+}
+
+message RetrieveRequestLogMetadata {
+	string result_source = 1;
+	repeated CacheEntity cache_content = 2;
+	repeated CrawlContext crawls = 3;
+	repeated ParseContext parses = 4;
+	int32 min_return_time = 5;
+}

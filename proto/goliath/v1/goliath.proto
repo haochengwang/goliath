@@ -1,0 +1,202 @@
+syntax = "proto3";
+
+option cc_generic_services = true;
+option go_package = "metastone.com/goliath/proto";
+
+package goliath;
+
+enum RetrieveType {
+  RAW = 0;
+  AUTO = 1;  // not supported for now
+  TEXT = 2;
+  MARKDOWN = 3;
+  IMAGE = 4;
+  PDF = 5;  // PDF extracted text
+  VIDEO_SUMMARY = 6;  // AI generated video summary on bilibili
+}
+
+enum RetrieveDestinationType {
+  DIRECT = 0;
+  COS = 1;
+}
+
+enum ContentType {
+  TYPE_UNKNOWN = 0;
+  TYPE_WEB_PAGE = 1;
+  TYPE_PDF = 2;
+}
+
+message RetrieveDestination {
+  RetrieveDestinationType destination_type = 1;
+
+  // Only for COS
+  string cos_bucket = 2;
+  string cos_path = 3;
+}
+
+message RetrieveRequest {
+  // Business Def
+  string biz_def = 1;
+
+  // If absent, Goliath will generate one in response
+  string request_id = 2;
+
+  // Url to crawl
+  string url = 3;
+
+  // Retrieve type
+  RetrieveType retrieve_type = 4;
+
+  // Retrieve destination
+  RetrieveDestination destination = 5;
+
+  // Whether to parse image urls in content
+  bool do_img_url_parse = 6;
+
+  // Whether bypass cache, if true, will not try to get and update cache
+  bool bypass_cache = 7;
+
+  // A hint indicating whether to go through foreign routing
+  // Will be DEPRECATED in the future
+  bool foreign_hint = 10;
+
+  // Search type
+  string search_type = 11;
+
+  // Expected service latency
+  int32 timeout_ms = 100;
+}
+
+message RetrieveResult {
+  string url = 1;
+  bytes title = 2;
+  bytes head_title = 3;
+  bytes content = 4;
+  string publish_time = 5;
+  repeated string image_list = 6;
+  repeated int32 position_list = 7;  // start from 0
+  ContentType source_content_type = 8;
+}
+
+message RetrieveResponse {
+  // The request_id in request, or auto generated one
+  string request_id = 1;
+
+  // 0 if success
+  int32 ret_code = 2;
+
+  // Error message if ret_code is not 0
+  string error_message = 3;
+
+  // Only filled when retrieve_destination_type == DIRECT
+  RetrieveResult result = 4;
+
+  // Additional debug information
+  string debug_string = 100;
+}
+
+enum SearchTimeType {
+  NO_LIMIT = 0;
+  HOUR = 1;
+  DAY = 2;
+  WEEK = 3;
+  MONTH = 4;
+  YEAR = 5;
+
+  // Specified
+  SPECIFIED_TIME_RANGE = 6;
+}
+
+message SearchTimeRange {
+  SearchTimeType search_time_type = 1;
+  string time_begin = 2;  // only for SPECIFIED_TIME_RANGE, format: YYYYMMDD
+  string time_end = 3;  // only for SPECIFIED_TIME_RANGE, format: YYYYMMDD
+}
+
+message SearchRequest {
+  // Business Def
+  string biz_def = 1;
+
+  // If absent, Goliath will generate one in response
+  string request_id = 2;
+
+  // Query string
+  string query = 3;
+
+  // TODO: Currently only one search_source supported
+  // In the future, muliple search source are allowed to
+  // enable parallel crawling from multiple search engines
+  repeated string search_source = 4;
+
+  // search time range
+  SearchTimeRange time_range = 5;
+
+  // A hint indicating whether to go through foreign routing
+  // will be DEPRECATED in the future
+  bool foreign_hint = 6;
+
+  // Expected service latency
+  int32 timeout_ms = 100;
+}
+
+enum SearchEngine {
+  UNKNOWN = 0;
+
+  GOOGLE = 1; // support
+  BING = 2; // support
+  DUCKDUCKGO = 3; // support
+  YAHOO = 4; // support
+  METAPHOR = 5; // support
+  YANDEX = 6;
+  ASK = 7; // support
+  YOUTUBE = 8;
+  BAIDU = 9;
+  TOUTIAO = 10;
+  GOOGLE_IMAGE = 11;
+  YAHOO_IMAGE = 12; // support
+  SO_IMAGE = 13;
+  BAIDU_IMAGE = 14; // support
+  TOUTIAO_NEWS = 15;
+  SOGOU_WEIXIN = 16;
+  GOOGLE_NEWS = 17; // support
+  DUCKDUCKGO_NEWS = 18; // support
+  DUCKDUCKGO_IMAGE = 19; // support
+  MIXED = 20; // google or duckduckgo random
+  SOGOU = 21;
+  SOGOU_NEWS = 22;
+  BAIDU_NEWS = 23;
+  SO360 = 24;
+  SO360_NEWS = 25;
+}
+
+message SearchItem {
+  string query = 1;
+  int32 pos = 2;
+  string title = 3;
+  string url = 4;
+  string summary = 5;
+  string publish_time = 6;
+  repeated string image_list = 7;
+}
+
+message SearchResponse {
+  // The request_id in request, or auto generated one
+  string request_id = 1;
+
+  // 0 if success
+  int32 ret_code = 2;
+
+  // Error message if ret_code is not 0
+  string error_message = 3;
+
+  // Search items
+  repeated SearchItem search_items = 4;
+
+  // Additional debug infomation
+  string debug_string = 100;
+}
+
+service GoliathPortal {
+  rpc Retrieve(RetrieveRequest) returns (RetrieveResponse);
+  rpc Search(SearchRequest) returns (SearchResponse);
+}

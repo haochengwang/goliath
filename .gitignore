@@ -26,6 +26,5 @@ go.work.sum
 .env
 
 # Potential executive files
-goliath
 main
 client

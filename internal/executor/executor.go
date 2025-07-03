@@ -936,6 +936,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 			TimecostMs:		int32(time.Since(startTime).Milliseconds()),
 			RetCode:		h.retrieveResponse.Load().RetCode,
 			Metadata:		string(metadataBytes),
+            SearchType:     req.SearchType,
 		}
 
 		msg, err := protojson.MarshalOptions {
