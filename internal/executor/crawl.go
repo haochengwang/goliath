@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,6 +26,14 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 		glog.Error("Failed to parse URL: ", parsedUrl)
 	}
 
+	region := "BJ"
+	timeoutMs := int32(60 * 1000)
+	// No blacklist or foreign whitelist for MARKDOWN_RICH
+	if req.RetrieveType == pb.RetrieveType_MARKDOWN_RICH {
+		region = "BJ-SPIDER"
+		return e.invokeHttpCrawl(ctx, req, region, timeoutMs)
+	}
+
 	for _, domain := range(e.conf.BlacklistDomain) {
 		if parsedUrl.Hostname() == domain {
 			glog.Info("URL Hit blacklist: ", req.Url)
@@ -43,8 +52,6 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 		}
 	}
 
-	region := "BJ"
-	timeoutMs := int32(60 * 1000)
 	maxContentLen := int32(30 * 1024 * 1024)
 	retryTimes := int32(1)
 	if foreign {
@@ -71,12 +78,25 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 	}
 }
 
-func (e *Executor) invokeNginxCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerKey string, timeoutMs int32) (*pb.CrawlContext, error) {
+type RenderCrawlResult struct {
+	Code	int `json:"code"`
+	Data	struct {
+		Render	struct {
+			Body	string `json:"body"`
+		}	`json:"render"`
+	}	`json:"data"`
+}
+
+func (e *Executor) invokeHttpCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerKey string, timeoutMs int32) (*pb.CrawlContext, error) {
 	startTime := time.Now()
 
 	maxContentLength := int64(30 * 1024 * 1024)
 
-	request, err := http.NewRequest("GET", req.Url, nil)
+	postData, _ := json.Marshal(map[string]string {
+		"url": req.Url,
+	})
+	request, err := http.NewRequest("POST", fmt.Sprintf("http://%s/api/v1/doc/fetch/render/",
+		e.crawlerAddrs[crawlerKey]), bytes.NewBuffer(postData))
 	if err != nil {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", "error", crawlerKey, "").Observe(elapsedSeconds)
@@ -89,15 +109,13 @@ func (e *Executor) invokeNginxCrawl(ctx context.Context, req *pb.RetrieveRequest
 			ErrorMessage:		err.Error(),
 		}, err
 	}
-	request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36 user agent to emulate pc")
-	request.Header.Set("Accept", "*/*")
+	request.Header.Set("Accept", "application/json")
+	request.Header.Set("Content-Type", "application/json")
 
-	proxyURL, _ := url.Parse(fmt.Sprintf("http://%s", e.crawlerAddrs[crawlerKey]))
 	client := &http.Client{
 		//Timeout: 	time.Duration(timeoutMs) * time.Millisecond,
 		Timeout:	100000 * time.Second,
 		Transport: &http.Transport{
-			Proxy:			http.ProxyURL(proxyURL),
 			// TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 			// Connection pool settings
 			IdleConnTimeout:	90 * time.Second,
@@ -159,7 +177,7 @@ func (e *Executor) invokeNginxCrawl(ctx context.Context, req *pb.RetrieveRequest
 	// }
 
 	bodyReader := io.LimitReader(resp.Body, maxContentLength)
-	body, err := io.ReadAll(bodyReader)
+	rawBody, err := io.ReadAll(bodyReader)
 	if err != nil {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", "error_read_body", crawlerKey, "").Observe(elapsedSeconds)
@@ -175,6 +193,40 @@ func (e *Executor) invokeNginxCrawl(ctx context.Context, req *pb.RetrieveRequest
 		}, err
 	}
 
+	retBody := RenderCrawlResult{}
+	err = json.Unmarshal(rawBody, &retBody)
+	if err != nil {
+		elapsedSeconds := time.Since(startTime).Seconds()
+		contextObserver(ctx, "crawl", "error_parse_body", crawlerKey, "").Observe(elapsedSeconds)
+		err = fmt.Errorf("HTTP Failed to parse content, Err = %v", err)
+		return &pb.CrawlContext {
+			CrawlerKey:		crawlerKey,
+			CrawlTimestampMs:	startTime.UnixMilli(),
+			CrawlTimecostMs:	int64(elapsedSeconds * 1000),
+			ContentType:		contentType,
+			ContentEncoding:	contentEncoding,
+			Success:		false,
+			ErrorMessage:		err.Error(),
+		}, err
+	}
+
+	if retBody.Code != 0 {
+		elapsedSeconds := time.Since(startTime).Seconds()
+		contextObserver(ctx, "crawl", "error_parse_body", crawlerKey, "").Observe(elapsedSeconds)
+		err = fmt.Errorf("HTTP Failed to parse content, Err = %v", err)
+		return &pb.CrawlContext {
+			CrawlerKey:		crawlerKey,
+			CrawlTimestampMs:	startTime.UnixMilli(),
+			CrawlTimecostMs:	int64(elapsedSeconds * 1000),
+			ContentType:		contentType,
+			ContentEncoding:	contentEncoding,
+			Success:		false,
+			ErrorMessage:		err.Error(),
+		}, err
+	}
+
+	body := retBody.Data.Render.Body
+
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextObserver(ctx, "crawl", "success", crawlerKey, "").Observe(elapsedSeconds)
 	return &pb.CrawlContext {
@@ -183,7 +235,7 @@ func (e *Executor) invokeNginxCrawl(ctx context.Context, req *pb.RetrieveRequest
 		CrawlTimecostMs:	int64(elapsedSeconds * 1000),
 		ContentType:		contentType,
 		ContentEncoding:	contentEncoding,
-		Content:		body,
+		Content:		[]byte(body),
 		ContentLen:		int64(len(body)),
 		Success:		true,
 	}, nil

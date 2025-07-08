@@ -25,8 +25,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/encoding/protojson"
-	"example.com/goliath/internal/utils"
 	"example.com/goliath/internal/config"
+	"example.com/goliath/internal/utils"
 	pb "example.com/goliath/proto/goliath/v1"
 	cpb "example.com/goliath/proto/crawler/v1"
 	ppb "example.com/goliath/proto/parser/v1"
@@ -210,6 +210,7 @@ func NewExecutor() *Executor {
 		crawlerAddrs:	map[string]string {
 			"BJ": 		"10.3.0.90:9023",
 			"BJNEW":	"10.3.32.116:9023",
+			"BJ-SPIDER":	"10.3.32.133:8888",
 			"BJ:RENDER":	"http://10.3.8.41:30001/download/",
 			"TOK":		"10.203.0.59:9023",
 			// Via nginx
@@ -222,6 +223,7 @@ func NewExecutor() *Executor {
 		parserAddrs:	map[string]string {
 			"BJ":		"10.3.128.4:9023",
 			"BJ-MED":	"10.3.16.19:50056",
+			"BJ-JINA":	"10.3.32.137:3000",
 		},
 		redisClient:		redisClient,
 		//nacosClient:		nacosClient,
@@ -444,94 +446,6 @@ func isPDF(req *pb.RetrieveRequest, contentType string) bool {
 		return req.RetrieveType == pb.RetrieveType_PDF
 	}
 	return strings.Contains(contentType, "pdf")
-}
-
-func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, crawlContext *pb.CrawlContext, parseTimeoutMs int32) (*ppb.ParseContentResponse, *pb.ParseContext, error) {
-	startTime := time.Now()
-
-	var pm ppb.ParseMethod
-	var parserRegion string
-
-	crawledContent := crawlContext.Content
-
-	if isPDF(req, crawlContext.ContentType) {
-		parserRegion = "BJ-MED"
-		pm = ppb.ParseMethod_PDF
-	} else if req.RetrieveType == pb.RetrieveType_VIDEO_SUMMARY {
-		parserRegion = "BJ-MED"
-		pm = ppb.ParseMethod_BILI
-	} else {
-		parserRegion = "BJ"
-		pm = ppb.ParseMethod_XPATH
-	}
-
-	conn, err := createGrpcConn(e.parserAddrs[parserRegion])
-	if err != nil {
-		glog.Error("Failed to create grpc connection: ", err)
-		return nil, &pb.ParseContext{
-			ParserKey:		parserRegion,
-			ParseTimestampMs:	startTime.UnixMilli(),
-			Success:		false,
-			ErrorMessage:		err.Error(),
-		}, err
-	}
-	defer conn.Close()
-
-	c := ppb.NewWebParserServiceClient(conn)
-
-	innerCtx, cancel := context.WithTimeout(ctx, time.Duration(parseTimeoutMs) * time.Millisecond)
-	defer cancel()
-
-	r, err := c.ParseContent(innerCtx, &ppb.ParseRequest{
-		Url:		req.Url,
-		ParseMethod:	pm,
-		Content:	crawledContent,
-		Encoding:	"utf-8",
-		ImgInContent:	req.DoImgUrlParse,
-	})
-
-	if err != nil {
-		elapsedSeconds := time.Since(startTime).Seconds()
-		contextObserver(ctx, "parse", "error", parserRegion, "").Observe(elapsedSeconds)
-		err = fmt.Errorf("Parse failed, err: %v", err)
-		return nil, &pb.ParseContext{
-			ParserKey:		parserRegion,
-			ParseTimestampMs:	startTime.UnixMilli(),
-			ParseTimecostMs:	int64(elapsedSeconds * 1000),
-			Success:		false,
-			ErrorMessage:		err.Error(),
-		}, err
-	}
-
-	if len(r.Content) == 0 {
-		elapsedSeconds := time.Since(startTime).Seconds()
-		contextObserver(ctx, "parse", "empty_content", parserRegion, "").Observe(elapsedSeconds)
-		err = fmt.Errorf("Parse failed no content")
-		return r, &pb.ParseContext{
-			ParserKey:		parserRegion,
-			ParseTimestampMs:	startTime.UnixMilli(),
-			ParseTimecostMs:	int64(elapsedSeconds * 1000),
-			Success:		false,
-			ErrorMessage:		err.Error(),
-		}, err
-	}
-
-	elapsedSeconds := time.Since(startTime).Seconds()
-	contextObserver(ctx, "parse", "success", parserRegion, "").Observe(elapsedSeconds)
-
-	result := convertParseResult(ctx, r).Result
-	// If PublishTime is not parsed, use last modified
-	if len(result.PublishTime) == 0 {
-		result.PublishTime = crawlContext.LastModified
-	}
-	return r, &pb.ParseContext{
-		ParserKey:		parserRegion,
-		ParseTimestampMs:	startTime.UnixMilli(),
-		ParseTimecostMs:	int64(elapsedSeconds * 1000),
-		Success:		true,
-		Result:			result,
-		ContentLen:		int64(len(r.Content)),
-	}, err
 }
 
 func (e *Executor) invokeSearch(ctx context.Context, req *pb.SearchRequest, region string, done chan interface{}) {
@@ -936,7 +850,7 @@ func (e *Executor) asyncRetrieve(ctx context.Context, req *pb.RetrieveRequest) *
 			TimecostMs:		int32(time.Since(startTime).Milliseconds()),
 			RetCode:		h.retrieveResponse.Load().RetCode,
 			Metadata:		string(metadataBytes),
-            SearchType:     req.SearchType,
+			SearchType:		req.SearchType,
 		}
 
 		msg, err := protojson.MarshalOptions {
@@ -1163,6 +1077,11 @@ func (e *Executor) Retrieve(ctx context.Context, req *pb.RetrieveRequest) *pb.Re
 		if sample {
 			e.asyncWorkerCall("redirect", func() { e.invokeDevRetrieve(ctx, req) })
 		} 
+	}
+
+	// Rewrite request to forbid cache if request type is MARKDOWN_RICH
+	if req.RetrieveType == pb.RetrieveType_MARKDOWN_RICH {
+		req.BypassCache = true
 	}
 	return e.asyncRetrieve(ctx, req)
 }

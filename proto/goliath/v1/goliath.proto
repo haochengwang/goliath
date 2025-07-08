@@ -13,6 +13,7 @@ enum RetrieveType {
   IMAGE = 4;
   PDF = 5;  // PDF extracted text
   VIDEO_SUMMARY = 6;  // AI generated video summary on bilibili
+  MARKDOWN_RICH = 7;  // For deep research
 }
 
 enum RetrieveDestinationType {
