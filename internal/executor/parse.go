@@ -22,12 +22,19 @@ func (e *Executor) invokeParse(ctx context.Context, req *pb.RetrieveRequest, cra
 	}
 }
 
+type JinaParseResult struct {
+	Title	string	`json:"title"`
+	Url	string	`json:"url"`
+	Content	string	`json:"content"`
+}
+
 func (e *Executor) invokeJinaParse(ctx context.Context, req *pb.RetrieveRequest, crawlContext *pb.CrawlContext, parseTimeoutMs int32) (*ppb.ParseContentResponse, *pb.ParseContext, error) {
 	startTime := time.Now()
 
 	parserKey := "BJ-JINA"
 	postData, _ := json.Marshal(map[string]string {
 		"html": string(crawlContext.Content),
+		"respondWith": "json",
 	})
 	request, err := http.NewRequest("POST", fmt.Sprintf("http://%s/%s",
 		e.parserAddrs[parserKey], req.Url), bytes.NewBuffer(postData))
@@ -87,10 +94,26 @@ func (e *Executor) invokeJinaParse(ctx context.Context, req *pb.RetrieveRequest,
 
 	maxContentLength := int64(4 * 1024 * 1024)
 	bodyReader := io.LimitReader(resp.Body, maxContentLength)
-	rawBody, err := io.ReadAll(bodyReader)
+	rawBody, _ := io.ReadAll(bodyReader)
 
+	jinaParseResult := JinaParseResult{}
+	err = json.Unmarshal(rawBody, &jinaParseResult)
+	if err != nil {
+		elapsedSeconds := time.Since(startTime).Seconds()
+		contextObserver(ctx, "parse", "error_response_format", parserKey, "").Observe(elapsedSeconds)
+		err = fmt.Errorf("Parse json failed, err = %v", err)
+		return nil, &pb.ParseContext {
+			ParserKey:		parserKey,
+			ParseTimestampMs:	startTime.UnixMilli(),
+			ParseTimecostMs:	int64(elapsedSeconds * 1000),
+			Success:		false,
+			ErrorMessage:		err.Error(),
+		}, err
+	}
 	result := ppb.ParseContentResponse{
-		Content:	rawBody,
+		Title:		[]byte(jinaParseResult.Title),
+		Url:		jinaParseResult.Url,
+		Content:	[]byte(jinaParseResult.Content),
 	}
 	// If PublishTime is not parsed, use last modified
 	if len(result.PublishTime) == 0 {
@@ -103,7 +126,9 @@ func (e *Executor) invokeJinaParse(ctx context.Context, req *pb.RetrieveRequest,
 		ParseTimecostMs:	int64(elapsedSeconds * 1000),
 		Success:		true,
 		Result:			&pb.RetrieveResult{
-			Content:	rawBody,
+			Title:		[]byte(jinaParseResult.Title),
+			Url:		jinaParseResult.Url,
+			Content:	[]byte(jinaParseResult.Content),
 		},
 		ContentLen:		int64(len(result.Content)),
 	}, err
