@@ -210,7 +210,6 @@ func NewExecutor() *Executor {
 		crawlerAddrs:	map[string]string {
 			"BJ": 		"10.3.0.90:9023",
 			"BJNEW":	"10.3.32.116:9023",
-			"BJ-SPIDER":	"10.3.32.133:8888",
 			"BJ:RENDER":	"http://10.3.8.41:30001/download/",
 			"TOK":		"10.203.0.59:9023",
 			// Via nginx

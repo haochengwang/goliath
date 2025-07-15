@@ -19,6 +19,108 @@ import (
 	cpb "example.com/goliath/proto/crawler/v1"
 )
 
+// Rendered crawl by chenxiaoxi
+type RenderCrawlResult struct {
+	Code	int 					`json:"code"`
+	Data	struct {
+		Render	struct {
+			Body	string 			`json:"body"`
+		}					`json:"render"`
+	}						`json:"data"`
+}
+
+// Offline cached doc by chenxiaoxi
+type SpiderCachedDoc struct {
+	Code	int					`json:"code"`
+	Data	struct {
+		Html	struct {
+			Url		string		`json:"url"`
+			StatusCode	int		`json:"status_code"`
+			Headers		map[string][]string	`json:"headers"`
+			Body	string 			`json:"body"`
+		}					`json:"html"`
+	}						`json:"data"`
+}
+
+type HttpCrawlHandler interface {
+	GetHttpRequest(r *pb.RetrieveRequest)	(*http.Request, error)
+	Parse([]byte)				(interface{}, error)
+	GetResultCode(interface{})		int
+	GetCrawledBody(interface{})		string
+	GetContentType(interface{})		string
+	GetContentEncoding(interface{})		string
+}
+
+type RenderCrawlHandler struct{}
+type SpiderCachedCrawlHandler struct{}
+
+func (h RenderCrawlHandler) GetHttpRequest(r *pb.RetrieveRequest) (*http.Request, error) {
+	postData, _ := json.Marshal(map[string]string {
+		"url": r.Url,
+	})
+	return http.NewRequest("POST", "http://10.3.32.133:8888/api/v1/doc/fetch/render/",
+		bytes.NewBuffer(postData))
+}
+
+func (h RenderCrawlHandler) Parse(rawBody []byte) (interface{}, error) {
+	retBody := RenderCrawlResult{}
+	err := json.Unmarshal(rawBody, &retBody)
+	if err != nil {
+		return nil, err
+	} else {
+		return &retBody, nil
+	}
+}
+
+func (h RenderCrawlHandler) GetResultCode(r interface{}) int {
+	return r.(*RenderCrawlResult).Code
+}
+
+func (h RenderCrawlHandler) GetCrawledBody(r interface{}) string {
+	return r.(*RenderCrawlResult).Data.Render.Body
+}
+
+func (h RenderCrawlHandler) GetContentType(r interface{}) string {
+	return ""
+}
+
+func (h RenderCrawlHandler) GetContentEncoding(r interface{}) string {
+	return ""
+}
+
+func (h SpiderCachedCrawlHandler) GetHttpRequest(req *pb.RetrieveRequest) (*http.Request, error) {
+	params := url.Values{}
+	params.Add("url", req.Url)
+	url := fmt.Sprintf("http://10.3.32.133:8888/api/v1/doc/html/?%s", params.Encode())
+	return http.NewRequest("GET", url, nil)
+}
+
+func (h SpiderCachedCrawlHandler) Parse(rawBody []byte) (interface{}, error) {
+	retBody := SpiderCachedDoc{}
+	err := json.Unmarshal(rawBody, &retBody)
+	if err != nil {
+		return nil, err
+	} else {
+		return &retBody, nil
+	}
+}
+
+func (h SpiderCachedCrawlHandler) GetResultCode(r interface{}) int {
+	return r.(*SpiderCachedDoc).Code
+}
+
+func (h SpiderCachedCrawlHandler) GetCrawledBody(r interface{}) string {
+	return r.(*SpiderCachedDoc).Data.Html.Body
+}
+
+func (h SpiderCachedCrawlHandler) GetContentType(r interface{}) string {
+	return ""
+}
+
+func (h SpiderCachedCrawlHandler) GetContentEncoding(r interface{}) string {
+	return ""
+}
+
 func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*pb.CrawlContext, error) {
 	foreign := req.ForeignHint
 	parsedUrl, err := url.Parse(req.Url)
@@ -30,18 +132,16 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 	timeoutMs := int32(60 * 1000)
 	// No blacklist or foreign whitelist for MARKDOWN_RICH
 	if req.RetrieveType == pb.RetrieveType_MARKDOWN_RICH {
-		region = "BJ-SPIDER"
-		return e.invokeHttpCrawl(ctx, req, region, timeoutMs)
+		c, err := e.invokeHttpCrawl(ctx, req, SpiderCachedCrawlHandler{}, "BJ-SPIDER", timeoutMs)
+		if c.Success {
+			return c, err
+		}
+		return e.invokeHttpCrawl(ctx, req, RenderCrawlHandler{}, "BJ-RENDER", timeoutMs)
 	}
 
 	for _, domain := range(e.conf.BlacklistDomain) {
 		if parsedUrl.Hostname() == domain {
-			glog.Info("URL Hit blacklist: ", req.Url)
-			return &pb.CrawlContext {
-				CrawlerKey:		"_NA",
-				Success:		false,
-				ErrorMessage:		"Hit blacklist",
-			}, err
+			return e.invokeHttpCrawl(ctx, req, SpiderCachedCrawlHandler{}, "BJ-SPIDER", timeoutMs)
 		}
 	}
 
@@ -78,25 +178,16 @@ func (e *Executor) invokeCrawl(ctx context.Context, req *pb.RetrieveRequest) (*p
 	}
 }
 
-type RenderCrawlResult struct {
-	Code	int `json:"code"`
-	Data	struct {
-		Render	struct {
-			Body	string `json:"body"`
-		}	`json:"render"`
-	}	`json:"data"`
-}
 
-func (e *Executor) invokeHttpCrawl(ctx context.Context, req *pb.RetrieveRequest, crawlerKey string, timeoutMs int32) (*pb.CrawlContext, error) {
+
+// Invoke a http request for crawling target url
+func (e *Executor) invokeHttpCrawl(ctx context.Context, req *pb.RetrieveRequest, h HttpCrawlHandler,
+		crawlerKey string, timeoutMs int32) (*pb.CrawlContext, error) {
 	startTime := time.Now()
 
 	maxContentLength := int64(30 * 1024 * 1024)
 
-	postData, _ := json.Marshal(map[string]string {
-		"url": req.Url,
-	})
-	request, err := http.NewRequest("POST", fmt.Sprintf("http://%s/api/v1/doc/fetch/render/",
-		e.crawlerAddrs[crawlerKey]), bytes.NewBuffer(postData))
+	request, err := h.GetHttpRequest(req)
 	if err != nil {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", "error", crawlerKey, "").Observe(elapsedSeconds)
@@ -193,8 +284,7 @@ func (e *Executor) invokeHttpCrawl(ctx context.Context, req *pb.RetrieveRequest,
 		}, err
 	}
 
-	retBody := RenderCrawlResult{}
-	err = json.Unmarshal(rawBody, &retBody)
+	retBody, err := h.Parse(rawBody)
 	if err != nil {
 		elapsedSeconds := time.Since(startTime).Seconds()
 		contextObserver(ctx, "crawl", "error_parse_body", crawlerKey, "").Observe(elapsedSeconds)
@@ -210,10 +300,10 @@ func (e *Executor) invokeHttpCrawl(ctx context.Context, req *pb.RetrieveRequest,
 		}, err
 	}
 
-	if retBody.Code != 0 {
+	if h.GetResultCode(retBody) != 0 {
 		elapsedSeconds := time.Since(startTime).Seconds()
-		contextObserver(ctx, "crawl", "error_parse_body", crawlerKey, "").Observe(elapsedSeconds)
-		err = fmt.Errorf("HTTP Failed to parse content, Err = %v", err)
+		contextObserver(ctx, "crawl", "error_ret_code", crawlerKey, "").Observe(elapsedSeconds)
+		err = fmt.Errorf("HTTP non-zero result code, Code =", h.GetResultCode(retBody))
 		return &pb.CrawlContext {
 			CrawlerKey:		crawlerKey,
 			CrawlTimestampMs:	startTime.UnixMilli(),
@@ -225,7 +315,13 @@ func (e *Executor) invokeHttpCrawl(ctx context.Context, req *pb.RetrieveRequest,
 		}, err
 	}
 
-	body := retBody.Data.Render.Body
+	body := h.GetCrawledBody(retBody)
+	if h.GetContentType(retBody) != "" {
+		contentType = h.GetContentType(retBody)
+	}
+	if h.GetContentEncoding(retBody) != "" {
+		contentEncoding = h.GetContentEncoding(retBody)
+	}
 
 	elapsedSeconds := time.Since(startTime).Seconds()
 	contextObserver(ctx, "crawl", "success", crawlerKey, "").Observe(elapsedSeconds)
